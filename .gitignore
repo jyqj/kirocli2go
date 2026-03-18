@@ -1,0 +1,21 @@
+# OS
+.DS_Store
+
+# Build
+bin/
+dist/
+build/
+
+# Go
+*.test
+coverage.out
+
+# Runtime
+data/
+resources/
+debug_logs/
+logs/
+
+# Editor
+.idea/
+.vscode/

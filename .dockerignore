@@ -1,0 +1,12 @@
+.git
+.gitignore
+.idea
+.vscode
+data
+logs
+dist
+build
+bin
+coverage.out
+*.test
+**/.DS_Store

@@ -1,0 +1,11 @@
+services:
+  kirocli-go:
+    build: .
+    container_name: kirocli-go
+    restart: unless-stopped
+    ports:
+      - "8089:8089"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
