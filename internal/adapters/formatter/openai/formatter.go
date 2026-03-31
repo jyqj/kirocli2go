@@ -31,6 +31,7 @@ func New() *Formatter {
 }
 
 func (f *Formatter) FormatStream(ctx context.Context, req message.UnifiedRequest, upstream ports.UpstreamStream, w io.Writer) error {
+	applyCommonHeaders(w, req)
 	prepareSSEHeaders(w)
 
 	flusher, _ := w.(http.Flusher)
@@ -207,6 +208,9 @@ func (f *Formatter) FormatStream(ctx context.Context, req message.UnifiedRequest
 			"prompt_tokens":     promptTokens,
 			"completion_tokens": completionTokens,
 			"total_tokens":      totalTokens,
+			"prompt_tokens_details": map[string]any{
+				"cached_tokens": req.Metadata.CacheReadInputTokens,
+			},
 		},
 	}); err != nil {
 		return err
@@ -219,6 +223,7 @@ func (f *Formatter) FormatStream(ctx context.Context, req message.UnifiedRequest
 }
 
 func (f *Formatter) FormatJSON(ctx context.Context, req message.UnifiedRequest, upstream ports.UpstreamStream, w io.Writer) error {
+	applyCommonHeaders(w, req)
 	splitter := &shared.ThinkingSplitter{}
 	var content strings.Builder
 	var reasoning strings.Builder
@@ -334,6 +339,9 @@ func (f *Formatter) FormatJSON(ctx context.Context, req message.UnifiedRequest, 
 			"prompt_tokens":     promptTokens,
 			"completion_tokens": completionTokens,
 			"total_tokens":      totalTokens,
+			"prompt_tokens_details": map[string]any{
+				"cached_tokens": req.Metadata.CacheReadInputTokens,
+			},
 		},
 	})
 }
@@ -345,6 +353,30 @@ func prepareSSEHeaders(w io.Writer) {
 		headers.Set("Cache-Control", "no-cache")
 		headers.Set("Connection", "keep-alive")
 	}
+}
+
+func applyCommonHeaders(w io.Writer, req message.UnifiedRequest) {
+	rw, ok := w.(interface{ Header() http.Header })
+	if !ok {
+		return
+	}
+	headers := rw.Header()
+	headers.Set("X-Kiro-Cache-Status", cacheStatus(req))
+	headers.Set("X-Kiro-Cache-Read-Input-Tokens", strconv.Itoa(req.Metadata.CacheReadInputTokens))
+	headers.Set("X-Kiro-Cache-Creation-Input-Tokens", strconv.Itoa(req.Metadata.CacheCreationInputTokens))
+	if req.Metadata.APIKeyID != "" {
+		headers.Set("X-Kiro-Auth-Key", req.Metadata.APIKeyID)
+	}
+}
+
+func cacheStatus(req message.UnifiedRequest) string {
+	if req.Metadata.FakeCacheKey == 0 {
+		return "bypass"
+	}
+	if req.Metadata.CacheHit {
+		return "hit"
+	}
+	return "miss"
 }
 
 func writeSSE(w io.Writer, payload any) error {

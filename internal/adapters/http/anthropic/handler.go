@@ -11,7 +11,9 @@ import (
 	"strings"
 	"time"
 
+	httpshared "kirocli-go/internal/adapters/http/shared"
 	"kirocli-go/internal/adapters/mcp/websearch"
+	"kirocli-go/internal/application/apikey"
 	"kirocli-go/internal/application/chat"
 	domainerrors "kirocli-go/internal/domain/errors"
 	"kirocli-go/internal/domain/message"
@@ -77,7 +79,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	unified.Metadata.FakeCacheKey = chat.ComputeCacheKey(body)
+	unified.Metadata.FakeCacheKey = chat.ComputeScopedCacheKey(unified.Metadata.FakeCacheNamespace, body)
 	unified.Metadata.EstimatedInputTokens = chat.EstimateAnthropicInputTokens(unified)
 
 	if err := h.chat.Handle(r.Context(), unified, ports.ResponseFormatAnthropic, w); err != nil {
@@ -176,6 +178,9 @@ func toUnifiedRequest(req MessagesRequest, r *http.Request) (message.UnifiedRequ
 		})
 	}
 
+	sessionKey := httpshared.SessionKeyFrom(r)
+	principal, _ := apikey.PrincipalFromContext(r.Context())
+
 	return message.UnifiedRequest{
 		Protocol:     message.ProtocolAnthropic,
 		Model:        req.Model,
@@ -184,8 +189,15 @@ func toUnifiedRequest(req MessagesRequest, r *http.Request) (message.UnifiedRequ
 		Messages:     messagesOut,
 		Tools:        tools,
 		Metadata: message.RequestMetadata{
-			ClientRequestID: requestIDFrom(r),
-			Endpoint:        r.URL.Path,
+			ClientRequestID:    requestIDFrom(r),
+			Endpoint:           r.URL.Path,
+			APIKeyID:           principal.ID,
+			SessionKey:         sessionKey,
+			WorkingDirectory:   httpshared.WorkingDirectoryFrom(r),
+			CompactRequested:   httpshared.CompactRequestedFrom(r),
+			StickyEnabled:      strings.TrimSpace(sessionKey) != "",
+			ChatTriggerType:    "MANUAL",
+			FakeCacheNamespace: principal.CacheNamespace,
 		},
 	}, nil
 }

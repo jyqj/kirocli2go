@@ -13,6 +13,7 @@ type Config struct {
 	Accounts   AccountsConfig
 	Background BackgroundConfig
 	State      StateConfig
+	Session    SessionConfig
 	Models     ModelsConfig
 	Upstream   UpstreamConfig
 }
@@ -25,7 +26,8 @@ type ServerConfig struct {
 }
 
 type SecurityConfig struct {
-	APIToken string
+	APIToken    string
+	APIKeysJSON string
 }
 
 type AccountsConfig struct {
@@ -61,6 +63,14 @@ type StateConfig struct {
 	CatalogPath     string
 }
 
+type SessionConfig struct {
+	StickyEnabled               bool
+	TTL                         time.Duration
+	SweepInterval               time.Duration
+	MaxEntries                  int
+	AutoCompactContextThreshold float64
+}
+
 type ModelsConfig struct {
 	ThinkingSuffix string
 }
@@ -89,7 +99,8 @@ func FromEnv() Config {
 			IdleTimeout:  durationEnv("KIROCLI_GO_IDLE_TIMEOUT_SEC", 90*time.Second),
 		},
 		Security: SecurityConfig{
-			APIToken: envOrDefault("KIROCLI_GO_API_TOKEN", ""),
+			APIToken:    envOrDefault("KIROCLI_GO_API_TOKEN", ""),
+			APIKeysJSON: envOrDefault("KIROCLI_GO_API_KEYS_JSON", ""),
 		},
 		Accounts: AccountsConfig{
 			Source:         envOrDefault("KIROCLI_GO_ACCOUNT_SOURCE", "auto"),
@@ -121,16 +132,23 @@ func FromEnv() Config {
 			StatsPath:       envOrDefault("KIROCLI_GO_STATS_STATE_PATH", "data/stats_state.json"),
 			CatalogPath:     envOrDefault("KIROCLI_GO_CATALOG_STATE_PATH", "data/catalog_state.json"),
 		},
+		Session: SessionConfig{
+			StickyEnabled:               boolEnv("KIROCLI_GO_SESSION_STICKY_ENABLED", true),
+			TTL:                         durationEnv("KIROCLI_GO_SESSION_TTL_SEC", 30*time.Minute),
+			SweepInterval:               durationEnv("KIROCLI_GO_SESSION_SWEEP_INTERVAL_SEC", 120*time.Second),
+			MaxEntries:                  intEnv("KIROCLI_GO_SESSION_MAX_ENTRIES", 1024),
+			AutoCompactContextThreshold: floatEnv("KIROCLI_GO_AUTO_COMPACT_CONTEXT_USAGE_THRESHOLD", 0.85),
+		},
 		Models: ModelsConfig{
 			ThinkingSuffix: envOrDefault("KIROCLI_GO_THINKING_SUFFIX", "-thinking"),
 		},
 		Upstream: UpstreamConfig{
-			CLIBaseURL:      envOrDefault("KIROCLI_GO_CLI_BASE_URL", "https://q.us-east-1.amazonaws.com/generateAssistantResponse"),
+			CLIBaseURL:      envOrDefault("KIROCLI_GO_CLI_BASE_URL", "https://q.us-east-1.amazonaws.com/"),
 			CLIModelsURL:    envOrDefault("KIROCLI_GO_CLI_MODELS_URL", "https://q.us-east-1.amazonaws.com?origin=KIRO_CLI"),
 			CLIMCPURL:       envOrDefault("KIROCLI_GO_CLI_MCP_URL", "https://q.us-east-1.amazonaws.com/mcp"),
 			CLIProxyURL:     envOrDefault("KIROCLI_GO_PROXY_URL", ""),
-			CLIUserAgent:    envOrDefault("KIROCLI_GO_CLI_USER_AGENT", "aws-sdk-rust/1.3.10 ua/2.1 api/codewhispererstreaming/0.1.12842 os/macos lang/rust/1.88.0 md/appVersion-1.23.1 app/AmazonQ-For-CLI"),
-			CLIAmzUserAgent: envOrDefault("KIROCLI_GO_CLI_AMZ_USER_AGENT", "aws-sdk-rust/1.3.10 ua/2.1 api/codewhispererstreaming/0.1.12842 os/macos lang/rust/1.88.0 m/F app/AmazonQ-For-CLI"),
+			CLIUserAgent:    envOrDefault("KIROCLI_GO_CLI_USER_AGENT", "aws-sdk-rust/1.3.12 ua/2.1 api/codewhispererstreaming/0.1.13922 os/macos lang/rust/1.92.0 md/appVersion-1.26.2 app/AmazonQ-For-CLI"),
+			CLIAmzUserAgent: envOrDefault("KIROCLI_GO_CLI_AMZ_USER_AGENT", "aws-sdk-rust/1.3.12 ua/2.1 api/codewhispererstreaming/0.1.13922 os/macos lang/rust/1.92.0 m/F app/AmazonQ-For-CLI"),
 			CLIOrigin:       envOrDefault("KIROCLI_GO_CLI_ORIGIN", "KIRO_CLI"),
 			CLITarget:       envOrDefault("KIROCLI_GO_CLI_TARGET", "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"),
 			CLIModelsTarget: envOrDefault("KIROCLI_GO_CLI_MODELS_TARGET", "AmazonCodeWhispererService.ListAvailableModels"),
@@ -171,6 +189,18 @@ func intEnv(key string, fallback int) int {
 		return fallback
 	}
 
+	return value
+}
+
+func floatEnv(key string, fallback float64) float64 {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return fallback
+	}
 	return value
 }
 

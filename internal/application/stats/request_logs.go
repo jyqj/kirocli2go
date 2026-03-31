@@ -12,6 +12,13 @@ type RequestLogEntry struct {
 	Endpoint                 string  `json:"endpoint"`
 	Model                    string  `json:"model"`
 	AccountID                string  `json:"account_id,omitempty"`
+	APIKeyID                 string  `json:"api_key_id,omitempty"`
+	StickySession            bool    `json:"sticky_session,omitempty"`
+	ConversationID           string  `json:"conversation_id,omitempty"`
+	ConversationEpoch        int     `json:"conversation_epoch,omitempty"`
+	CompactReason            string  `json:"compact_reason,omitempty"`
+	PayloadStrategy          string  `json:"payload_strategy,omitempty"`
+	CacheHit                 bool    `json:"cache_hit,omitempty"`
 	Success                  bool    `json:"success"`
 	Attempts                 int     `json:"attempts"`
 	StatusCode               int     `json:"status_code,omitempty"`
@@ -34,15 +41,19 @@ type RequestLogRing struct {
 }
 
 type RequestLogQuery struct {
-	Limit         int
-	Offset        int
-	Protocol      string
-	Endpoint      string
-	Model         string
-	AccountID     string
-	Success       *bool
-	FailureReason string
-	BodySignal    string
+	Limit           int
+	Offset          int
+	Protocol        string
+	Endpoint        string
+	Model           string
+	AccountID       string
+	APIKeyID        string
+	ConversationID  string
+	CompactReason   string
+	PayloadStrategy string
+	Success         *bool
+	FailureReason   string
+	BodySignal      string
 }
 
 func NewRequestLogRing(size int) *RequestLogRing {
@@ -121,6 +132,18 @@ func matchesRequestLogQuery(entry RequestLogEntry, query RequestLogQuery) bool {
 		return false
 	}
 	if query.AccountID != "" && entry.AccountID != query.AccountID {
+		return false
+	}
+	if query.APIKeyID != "" && entry.APIKeyID != query.APIKeyID {
+		return false
+	}
+	if query.ConversationID != "" && entry.ConversationID != query.ConversationID {
+		return false
+	}
+	if query.CompactReason != "" && entry.CompactReason != query.CompactReason {
+		return false
+	}
+	if query.PayloadStrategy != "" && entry.PayloadStrategy != query.PayloadStrategy {
 		return false
 	}
 	if query.Success != nil && entry.Success != *query.Success {

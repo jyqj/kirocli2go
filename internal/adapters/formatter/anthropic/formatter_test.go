@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http/httptest"
 	"testing"
 
 	"kirocli-go/internal/domain/message"
@@ -74,5 +75,35 @@ func TestFormatJSONUsesFakeCacheAndPreciseOutputTokens(t *testing.T) {
 	}
 	if usage["output_tokens"].(float64) != 77 {
 		t.Fatalf("expected output_tokens 77, got %v", usage["output_tokens"])
+	}
+}
+
+func TestFormatJSONExposesCacheHeaders(t *testing.T) {
+	formatter := New()
+	streamIn := &stubUpstreamStream{
+		events: []stream.Event{
+			{Type: stream.EventTypeText, Text: "hello"},
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	req := message.UnifiedRequest{
+		Model: "claude-sonnet-4.5",
+		Metadata: message.RequestMetadata{
+			APIKeyID:                 "team-a",
+			FakeCacheKey:             1,
+			CacheHit:                 false,
+			CacheCreationInputTokens: 256,
+			CacheReadInputTokens:     0,
+		},
+	}
+	if err := formatter.FormatJSON(context.Background(), req, streamIn, rec); err != nil {
+		t.Fatalf("FormatJSON error: %v", err)
+	}
+	if rec.Header().Get("X-Kiro-Cache-Status") != "miss" {
+		t.Fatalf("expected cache status miss, got %q", rec.Header().Get("X-Kiro-Cache-Status"))
+	}
+	if rec.Header().Get("X-Kiro-Cache-Creation-Input-Tokens") != "256" {
+		t.Fatalf("expected cache creation header 256, got %q", rec.Header().Get("X-Kiro-Cache-Creation-Input-Tokens"))
 	}
 }

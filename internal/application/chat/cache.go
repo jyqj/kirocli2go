@@ -4,6 +4,7 @@ import (
 	"hash/fnv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"kirocli-go/internal/domain/message"
@@ -15,6 +16,19 @@ const fakeCacheTTL = 5 * time.Minute
 type FakeCache struct {
 	mu    sync.Mutex
 	items map[uint64]time.Time
+
+	lookups int64
+	hits    int64
+	misses  int64
+}
+
+type FakeCacheSnapshot struct {
+	Entries    int     `json:"entries"`
+	Lookups    int64   `json:"lookups"`
+	Hits       int64   `json:"hits"`
+	Misses     int64   `json:"misses"`
+	HitRate    float64 `json:"hit_rate"`
+	TTLSeconds int64   `json:"ttl_seconds"`
 }
 
 func NewFakeCache() *FakeCache {
@@ -26,7 +40,15 @@ func NewFakeCache() *FakeCache {
 }
 
 func ComputeCacheKey(rawBody []byte) uint64 {
+	return ComputeScopedCacheKey("", rawBody)
+}
+
+func ComputeScopedCacheKey(namespace string, rawBody []byte) uint64 {
 	h := fnv.New64a()
+	if strings.TrimSpace(namespace) != "" {
+		_, _ = h.Write([]byte(namespace))
+		_, _ = h.Write([]byte{0})
+	}
 	cutoff := len(rawBody) * 4 / 5
 	if cutoff < 128 {
 		cutoff = len(rawBody)
@@ -41,12 +63,15 @@ func ComputeCacheKey(rawBody []byte) uint64 {
 func (fc *FakeCache) Lookup(key uint64) bool {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
+	atomic.AddInt64(&fc.lookups, 1)
 
 	if ts, ok := fc.items[key]; ok && time.Since(ts) < fakeCacheTTL {
 		fc.items[key] = time.Now()
+		atomic.AddInt64(&fc.hits, 1)
 		return true
 	}
 	fc.items[key] = time.Now()
+	atomic.AddInt64(&fc.misses, 1)
 	return false
 }
 
@@ -62,6 +87,30 @@ func (fc *FakeCache) cleanup() {
 			}
 		}
 		fc.mu.Unlock()
+	}
+}
+
+func (fc *FakeCache) Snapshot() FakeCacheSnapshot {
+	if fc == nil {
+		return FakeCacheSnapshot{}
+	}
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+
+	lookups := atomic.LoadInt64(&fc.lookups)
+	hits := atomic.LoadInt64(&fc.hits)
+	misses := atomic.LoadInt64(&fc.misses)
+	hitRate := 0.0
+	if lookups > 0 {
+		hitRate = float64(hits) / float64(lookups)
+	}
+	return FakeCacheSnapshot{
+		Entries:    len(fc.items),
+		Lookups:    lookups,
+		Hits:       hits,
+		Misses:     misses,
+		HitRate:    hitRate,
+		TTLSeconds: int64(fakeCacheTTL.Seconds()),
 	}
 }
 

@@ -4,15 +4,27 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"kirocli-go/internal/application/chat"
+	"kirocli-go/internal/application/session"
 	appstats "kirocli-go/internal/application/stats"
 )
 
 type Handler struct {
 	collector *appstats.Collector
+	sessions  interface {
+		Snapshot() session.Snapshot
+	}
+	cache interface {
+		Snapshot() chat.FakeCacheSnapshot
+	}
 }
 
-func NewHandler(collector *appstats.Collector) *Handler {
-	return &Handler{collector: collector}
+func NewHandler(collector *appstats.Collector, sessions interface {
+	Snapshot() session.Snapshot
+}, cache interface {
+	Snapshot() chat.FakeCacheSnapshot
+}) *Handler {
+	return &Handler{collector: collector, sessions: sessions, cache: cache}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -27,8 +39,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	response := map[string]any{
 		"status": "ok",
 		"stats":  h.collector.Snapshot(),
-	})
+	}
+	if h.sessions != nil {
+		response["sessions"] = h.sessions.Snapshot()
+	}
+	if h.cache != nil {
+		response["fake_cache"] = h.cache.Snapshot()
+	}
+	_ = json.NewEncoder(w).Encode(response)
 }

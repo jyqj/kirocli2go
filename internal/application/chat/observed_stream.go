@@ -15,11 +15,13 @@ import (
 type observedStream struct {
 	inner ports.UpstreamStream
 
-	text      strings.Builder
-	reasoning strings.Builder
-	toolInput strings.Builder
-	usage     stream.Usage
-	hasUsage  bool
+	text           strings.Builder
+	reasoning      strings.Builder
+	toolInput      strings.Builder
+	usage          stream.Usage
+	hasUsage       bool
+	conversationID string
+	contextUsage   float64
 
 	// Truncation tracking
 	pendingTools  map[string]string // toolCallID → toolName (started, not done)
@@ -79,6 +81,13 @@ func (s *observedStream) Next(ctx context.Context) (stream.Event, error) {
 			}
 			s.hasUsage = true
 		}
+	case stream.EventTypeMetadata:
+		if event.ConversationID != "" {
+			s.conversationID = event.ConversationID
+		}
+		if event.ContextUsagePercentage > 0 {
+			s.contextUsage = event.ContextUsagePercentage
+		}
 	}
 
 	return event, nil
@@ -131,6 +140,21 @@ func (s *observedStream) PreciseUsage() *stream.Usage {
 
 func (s *observedStream) ApproxOutputTokens() int {
 	return tokenutil.CountText(s.text.String() + s.reasoning.String() + s.toolInput.String())
+}
+
+func (s *observedStream) ConversationID() string {
+	return s.conversationID
+}
+
+func (s *observedStream) ContextUsagePercentage() float64 {
+	return s.contextUsage
+}
+
+func (s *observedStream) ShouldAutoCompact(threshold float64) bool {
+	if threshold <= 0 {
+		return false
+	}
+	return s.contextUsage >= threshold
 }
 
 // WasTruncated returns true if the stream ended with unclosed tool calls,

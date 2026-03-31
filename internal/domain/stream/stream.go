@@ -12,6 +12,7 @@ const (
 	EventTypeReasoning  EventType = "reasoning"
 	EventTypeToolCall   EventType = "tool_call"
 	EventTypeUsage      EventType = "usage"
+	EventTypeMetadata   EventType = "metadata"
 	EventTypeCompletion EventType = "completion"
 	EventTypeError      EventType = "error"
 )
@@ -26,11 +27,13 @@ type Usage struct {
 }
 
 type Event struct {
-	Type         EventType
-	Text         string
-	ToolCall     *message.ToolCall
-	ToolCallDone bool
-	Usage        *Usage
-	FinishReason string
-	Error        *domainerrors.UpstreamError
+	Type                   EventType
+	Text                   string
+	ToolCall               *message.ToolCall
+	ToolCallDone           bool
+	Usage                  *Usage
+	FinishReason           string
+	ConversationID         string
+	ContextUsagePercentage float64
+	Error                  *domainerrors.UpstreamError
 }

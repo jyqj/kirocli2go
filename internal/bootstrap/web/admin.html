@@ -304,6 +304,140 @@
       padding-bottom: 6px;
     }
 
+    .dashboard-grid {
+      display: grid;
+      gap: 16px;
+    }
+
+    .dashboard-overview {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .dashboard-card {
+      position: relative;
+      overflow: hidden;
+      border-radius: 18px;
+      padding: 16px;
+      border: 1px solid var(--border);
+      background:
+        linear-gradient(135deg, rgba(15, 118, 110, 0.08), rgba(17, 24, 39, 0.02)),
+        rgba(255,255,255,0.9);
+    }
+
+    .dashboard-card::after {
+      content: "";
+      position: absolute;
+      inset: auto -10% -42% 45%;
+      height: 120px;
+      background: linear-gradient(90deg, rgba(15, 118, 110, 0.18), rgba(17, 24, 39, 0));
+      transform: rotate(-8deg);
+      pointer-events: none;
+    }
+
+    .dashboard-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--muted);
+      margin-bottom: 10px;
+      font-family: "IBM Plex Mono", monospace;
+    }
+
+    .dashboard-value {
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: -0.05em;
+      margin-bottom: 8px;
+    }
+
+    .dashboard-note {
+      font-size: 13px;
+      color: var(--muted);
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .dashboard-section {
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 16px;
+      background: rgba(255,255,255,0.84);
+    }
+
+    .dashboard-section h3 {
+      margin: 0 0 12px;
+      font-size: 14px;
+      letter-spacing: 0.02em;
+    }
+
+    .status-bars {
+      display: grid;
+      gap: 10px;
+    }
+
+    .status-bar {
+      display: grid;
+      gap: 6px;
+    }
+
+    .status-bar-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .status-bar-track {
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(17, 50, 43, 0.08);
+      overflow: hidden;
+    }
+
+    .status-bar-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #0f766e, #134e4a);
+    }
+
+    .compact-list, .recent-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .compact-item, .recent-item {
+      border-radius: 14px;
+      padding: 12px 14px;
+      background: rgba(15, 118, 110, 0.06);
+      border: 1px solid rgba(15, 118, 110, 0.12);
+    }
+
+    .recent-item {
+      background: rgba(17, 24, 39, 0.04);
+      border-color: rgba(17, 24, 39, 0.08);
+    }
+
+    .recent-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 8px;
+      font-size: 13px;
+    }
+
+    .recent-meta {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
     .muted { color: var(--muted); }
     .hidden { display: none !important; }
     .busy button,
@@ -368,6 +502,7 @@
     @media (max-width: 720px) {
       .shell { padding: 14px; }
       .stats-grid, .filters { grid-template-columns: 1fr; }
+      .dashboard-overview { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -631,45 +766,124 @@
     }
 
     function renderStatus(statusData) {
-      document.getElementById('statAccounts').textContent = statusData.accounts ?? 0;
-      document.getElementById('statActive').textContent = statusData.active ?? 0;
-      document.getElementById('statRequests').textContent = statusData.stats?.total_requests ?? 0;
-      document.getElementById('statCredits').textContent = (statusData.stats?.total_credits ?? 0).toFixed(2);
+      const dashboard = statusData.dashboard || {};
+      const summary = dashboard.summary || {};
+      const sections = dashboard.sections || {};
+      const stats = statusData.stats || sections.stats || {};
+      const pool = statusData.pool || sections.pool || {};
+      const sessions = statusData.sessions || sections.sessions || {};
+      const fakeCache = statusData.fake_cache || sections.fake_cache || {};
+
+      document.getElementById('statAccounts').textContent = summary.accounts_total ?? statusData.accounts ?? 0;
+      document.getElementById('statActive').textContent = summary.accounts_active ?? statusData.active ?? 0;
+      document.getElementById('statRequests').textContent = summary.requests_total ?? stats.total_requests ?? 0;
+      document.getElementById('statCredits').textContent = Number(summary.credits_total ?? stats.total_credits ?? 0).toFixed(2);
 
       const panel = document.getElementById('statusPanel');
-      panel.innerHTML = '';
-      const items = [
-        ['状态', statusData.status],
-        ['活跃账号', `${statusData.active ?? 0} / ${statusData.accounts ?? 0}`],
-        ['活跃池', `${statusData.pool?.warmed_accounts ?? 0} / ${statusData.pool?.target_size ?? 0}`],
-        ['池维护 warm runs', statusData.pool?.warm_runs ?? 0],
-        ['池维护 refresh runs', statusData.pool?.refresh_runs ?? 0],
-        ['池补仓 fetches', statusData.pool?.refill_fetches ?? 0],
-        ['最近池动作', `${statusData.pool?.last_action || '-'} @ ${formatUnixTime(statusData.pool?.last_action_unix)}`],
-        ['最近补仓新增', statusData.pool?.last_refill_add ?? 0],
-        ['池维护错误', statusData.pool?.last_error || '-'],
-        ['成功请求', statusData.stats?.success_requests ?? 0],
-        ['失败请求', statusData.stats?.failed_requests ?? 0],
-        ['尝试失败', statusData.stats?.attempt_failed_requests ?? 0],
-        ['总重试', statusData.stats?.total_retries ?? 0],
-        ['输入 Tokens', statusData.stats?.total_input_tokens ?? 0],
-        ['输出 Tokens', statusData.stats?.total_output_tokens ?? 0],
-        ['Credits', (statusData.stats?.total_credits ?? 0).toFixed(4)]
-      ];
-      items.forEach(([label, value]) => {
-        const item = document.createElement('div');
-        item.className = 'kv-item';
-        item.innerHTML = `<span class="muted">${label}</span><strong>${value}</strong>`;
-        panel.appendChild(item);
-      });
-      if (statusData.by_status) {
-        Object.entries(statusData.by_status).forEach(([key, value]) => {
-          const item = document.createElement('div');
-          item.className = 'kv-item';
-          item.innerHTML = `<span class="muted">status.${key}</span><strong>${value}</strong>`;
-          panel.appendChild(item);
-        });
-      }
+      const byStatus = statusData.by_status || {};
+      const totalAccounts = Number(summary.accounts_total ?? statusData.accounts ?? 0);
+      const compactTriggers = sections.recent?.compact_triggers || stats?.compact_triggers || {};
+      const recentEntries = sections.recent?.entries || [];
+      const compactMarkup = Object.entries(compactTriggers).map(([key, value]) => `
+        <div class="compact-item">
+          <div class="recent-title"><strong>${key}</strong><span class="badge">${value}</span></div>
+        </div>
+      `).join('') || '<div class="compact-item muted">暂无 compact 触发</div>';
+
+      const recentMarkup = recentEntries.slice(0, 5).map((entry) => `
+        <div class="recent-item">
+          <div class="recent-title">
+            <strong>${entry.endpoint}</strong>
+            <span class="badge ${entry.success ? 'active' : 'disabled'}">${entry.success ? 'success' : 'failure'}</span>
+          </div>
+          <div class="recent-meta">
+            <span>${entry.protocol}</span>
+            <span>${entry.model}</span>
+            <span>tokens ${entry.total_tokens || 0}</span>
+            <span>credits ${Number(entry.credits || 0).toFixed(4)}</span>
+            <span>${formatRelativeTime(entry.time)} 前</span>
+          </div>
+          ${entry.compact_reason ? `<div class="recent-meta" style="margin-top:6px;"><span>compact ${entry.compact_reason}</span></div>` : ''}
+          ${entry.error ? `<div class="recent-meta" style="margin-top:6px;color:var(--danger);">${entry.error}</div>` : ''}
+        </div>
+      `).join('') || '<div class="recent-item muted">暂无最近请求</div>';
+
+      const statusBars = Object.entries(byStatus).map(([key, value]) => {
+        const pct = totalAccounts > 0 ? (Number(value) / totalAccounts) * 100 : 0;
+        return `
+          <div class="status-bar">
+            <div class="status-bar-head">
+              <span>${key}</span>
+              <strong>${value}</strong>
+            </div>
+            <div class="status-bar-track"><div class="status-bar-fill" style="width:${pct}%;"></div></div>
+          </div>
+        `;
+      }).join('') || '<div class="muted">暂无状态分布</div>';
+
+      panel.innerHTML = `
+        <div class="dashboard-overview">
+          <div class="dashboard-card">
+            <div class="dashboard-label">Requests</div>
+            <div class="dashboard-value">${summary.requests_total ?? stats.total_requests ?? 0}</div>
+            <div class="dashboard-note">
+              <span>success ${summary.requests_success ?? stats.success_requests ?? 0}</span>
+              <span>failure ${summary.requests_failed ?? stats.failed_requests ?? 0}</span>
+            </div>
+          </div>
+          <div class="dashboard-card">
+            <div class="dashboard-label">Credits</div>
+            <div class="dashboard-value">${Number(summary.credits_total ?? stats.total_credits ?? 0).toFixed(2)}</div>
+            <div class="dashboard-note">
+              <span>input ${stats.total_input_tokens ?? 0}</span>
+              <span>output ${stats.total_output_tokens ?? 0}</span>
+            </div>
+          </div>
+          <div class="dashboard-card">
+            <div class="dashboard-label">Fake Cache</div>
+            <div class="dashboard-value">${((summary.fake_cache_hit_rate ?? fakeCache.hit_rate ?? 0) * 100).toFixed(1)}%</div>
+            <div class="dashboard-note">
+              <span>hits ${summary.fake_cache_hits ?? fakeCache.hits ?? 0}</span>
+              <span>lookups ${summary.fake_cache_lookups ?? fakeCache.lookups ?? 0}</span>
+            </div>
+          </div>
+          <div class="dashboard-card">
+            <div class="dashboard-label">Sessions</div>
+            <div class="dashboard-value">${summary.sessions_active ?? sessions.active_sessions ?? 0}</div>
+            <div class="dashboard-note">
+              <span>compact ${summary.compact_total ?? 0}</span>
+              <span>ttl ${sessions.ttl_seconds ?? fakeCache.ttl_seconds ?? 0}s</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="dashboard-section">
+          <h3>系统总览</h3>
+          <div class="kv">
+            <div class="kv-item"><span class="muted">状态</span><strong>${statusData.status}</strong></div>
+            <div class="kv-item"><span class="muted">活跃账号</span><strong>${summary.accounts_active ?? statusData.active ?? 0} / ${summary.accounts_total ?? statusData.accounts ?? 0}</strong></div>
+            <div class="kv-item"><span class="muted">活跃池</span><strong>${summary.pool_warmed_accounts ?? pool.warmed_accounts ?? 0} / ${summary.pool_target_size ?? pool.target_size ?? 0}</strong></div>
+            <div class="kv-item"><span class="muted">Catalog</span><strong>${summary.catalog_models_cached ?? 0} models</strong></div>
+            <div class="kv-item"><span class="muted">最近池动作</span><strong>${pool.last_action || '-'} @ ${formatUnixTime(pool.last_action_unix)}</strong></div>
+            <div class="kv-item"><span class="muted">池错误</span><strong>${pool.last_error || '-'}</strong></div>
+          </div>
+        </div>
+
+        <div class="dashboard-section">
+          <h3>账号状态分布</h3>
+          <div class="status-bars">${statusBars}</div>
+        </div>
+
+        <div class="dashboard-section">
+          <h3>Compact 触发</h3>
+          <div class="compact-list">${compactMarkup}</div>
+        </div>
+
+        <div class="dashboard-section">
+          <h3>最近请求</h3>
+          <div class="recent-list">${recentMarkup}</div>
+        </div>
+      `;
     }
 
     function badgeClass(status) {
@@ -845,7 +1059,7 @@
     }
 
     async function loadStatus() {
-      const data = await api('/admin/api/status');
+      const data = await api('/admin/api/dashboard');
       renderStatus(data);
     }
 

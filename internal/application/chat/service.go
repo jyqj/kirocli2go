@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
+	"kirocli-go/internal/application/session"
 	appstats "kirocli-go/internal/application/stats"
 	"kirocli-go/internal/domain/account"
 	domainerrors "kirocli-go/internal/domain/errors"
@@ -17,6 +19,7 @@ type Dependencies struct {
 	Tokens             ports.TokenProvider
 	Upstream           ports.UpstreamClient
 	Catalog            ports.ModelCatalog
+	Sessions           *session.Manager
 	OpenAIFormatter    ports.Formatter
 	AnthropicFormatter ports.Formatter
 	Cache              *FakeCache
@@ -28,6 +31,7 @@ type Service struct {
 	tokens             ports.TokenProvider
 	upstream           ports.UpstreamClient
 	catalog            ports.ModelCatalog
+	sessions           *session.Manager
 	openAIFormatter    ports.Formatter
 	anthropicFormatter ports.Formatter
 	cache              *FakeCache
@@ -36,6 +40,18 @@ type Service struct {
 }
 
 const maxSendAttempts = 3
+
+const (
+	autoCompactMinHistoryMessages = 12
+	autoCompactMessageDropRatio   = 0.5
+	autoCompactMinInputTokens     = 6000
+	autoCompactTokenDropRatio     = 0.55
+
+	payloadStrategyReplay        = "replay"
+	payloadStrategyReplaySeed    = "replay_seed"
+	payloadStrategyStickyFull    = "sticky_full"
+	payloadStrategyStickyCompact = "sticky_compact"
+)
 
 func NewService(deps Dependencies) (*Service, error) {
 	switch {
@@ -58,6 +74,7 @@ func NewService(deps Dependencies) (*Service, error) {
 			tokens:             deps.Tokens,
 			upstream:           deps.Upstream,
 			catalog:            deps.Catalog,
+			sessions:           deps.Sessions,
 			openAIFormatter:    deps.OpenAIFormatter,
 			anthropicFormatter: deps.AnthropicFormatter,
 			cache:              cache,
@@ -86,16 +103,25 @@ func (s *Service) Handle(ctx context.Context, req message.UnifiedRequest, format
 
 	s.prepareRequestMetadata(&req)
 
+	var binding session.Binding
+	stickyActive := s.sessions != nil && req.Metadata.StickyEnabled && strings.TrimSpace(req.Metadata.SessionKey) != ""
+	if stickyActive {
+		binding = s.prepareSessionBinding(&req)
+		s.recordCompactReason(req.Metadata.CompactReason)
+	}
+	req.Metadata.PayloadStrategy = s.determinePayloadStrategy(req)
+
 	formatter := s.formatterFor(format)
 	if formatter == nil {
 		return domainerrors.New(domainerrors.CategoryValidation, "formatter not configured")
 	}
 
 	acquireHint := account.AcquireHint{
-		Profile:  account.ProfileCLI,
-		Model:    resolvedModel.InternalName,
-		Protocol: string(req.Protocol),
-		Stream:   req.Stream,
+		Profile:            account.ProfileCLI,
+		Model:              resolvedModel.InternalName,
+		Protocol:           string(req.Protocol),
+		Stream:             req.Stream,
+		PreferredAccountID: req.Metadata.PreferredAccountID,
 	}
 
 	var lastErr error
@@ -112,6 +138,28 @@ func (s *Service) Handle(ctx context.Context, req message.UnifiedRequest, format
 			return err
 		}
 
+		if stickyActive {
+			if binding.AccountID != "" && lease.AccountID != binding.AccountID {
+				req.Metadata.CompactReason = "account_changed"
+				s.recordCompactReason(req.Metadata.CompactReason)
+				binding = s.sessions.RotateWithReason(req.Metadata.SessionKey, req.Metadata.WorkingDirectory, req.Metadata.CompactReason)
+				req.Metadata.ConversationID = binding.ConversationID
+				req.Metadata.ConversationEpoch = binding.Epoch
+				req.Metadata.PayloadStrategy = payloadStrategyStickyCompact
+			}
+			if updated, ok := s.sessions.Update(req.Metadata.SessionKey, session.Update{
+				ConversationID:   req.Metadata.ConversationID,
+				AccountID:        lease.AccountID,
+				WorkingDirectory: req.Metadata.WorkingDirectory,
+				Model:            req.Model,
+				InputTokens:      req.Metadata.EstimatedInputTokens,
+				MessageCount:     len(req.Messages),
+				Touch:            true,
+			}); ok {
+				binding = updated
+			}
+		}
+
 		upstream, err := s.upstream.Send(ctx, ports.UpstreamRequest{
 			Lease:   lease,
 			Model:   resolvedModel,
@@ -122,19 +170,12 @@ func (s *Service) Handle(ctx context.Context, req message.UnifiedRequest, format
 			failure.Attempts = attempt
 			_ = s.tokens.ReportFailure(ctx, lease, failure)
 			lastErr = err
-			s.recordRequestLog(appstats.RequestLogEntry{
-				RequestID:     req.Metadata.ClientRequestID,
-				Protocol:      string(req.Protocol),
-				Endpoint:      req.Metadata.Endpoint,
-				Model:         req.Model,
-				AccountID:     lease.AccountID,
-				Success:       false,
-				Attempts:      attempt,
+			s.recordRequestLog(s.buildRequestLogEntry(req, lease.AccountID, false, attempt, appstats.RequestLogEntry{
 				StatusCode:    failure.StatusCode,
 				Error:         failure.Message,
 				FailureReason: string(failure.Reason),
 				BodySignal:    failure.BodySignal,
-			})
+			}))
 			if shouldRetry(err, attempt) {
 				continue
 			}
@@ -153,19 +194,12 @@ func (s *Service) Handle(ctx context.Context, req message.UnifiedRequest, format
 			failure := failureMetaFromError(req, err)
 			failure.Attempts = attempt
 			_ = s.tokens.ReportFailure(ctx, lease, failure)
-			s.recordRequestLog(appstats.RequestLogEntry{
-				RequestID:     req.Metadata.ClientRequestID,
-				Protocol:      string(req.Protocol),
-				Endpoint:      req.Metadata.Endpoint,
-				Model:         req.Model,
-				AccountID:     lease.AccountID,
-				Success:       false,
-				Attempts:      attempt,
+			s.recordRequestLog(s.buildRequestLogEntry(req, lease.AccountID, false, attempt, appstats.RequestLogEntry{
 				StatusCode:    failure.StatusCode,
 				Error:         failure.Message,
 				FailureReason: string(failure.Reason),
 				BodySignal:    failure.BodySignal,
-			})
+			}))
 			s.recordFailure(req, failure)
 			return err
 		}
@@ -173,36 +207,53 @@ func (s *Service) Handle(ctx context.Context, req message.UnifiedRequest, format
 			failure := failureMetaFromError(req, closeErr)
 			failure.Attempts = attempt
 			_ = s.tokens.ReportFailure(ctx, lease, failure)
-			s.recordRequestLog(appstats.RequestLogEntry{
-				RequestID:     req.Metadata.ClientRequestID,
-				Protocol:      string(req.Protocol),
-				Endpoint:      req.Metadata.Endpoint,
-				Model:         req.Model,
-				AccountID:     lease.AccountID,
-				Success:       false,
-				Attempts:      attempt,
+			s.recordRequestLog(s.buildRequestLogEntry(req, lease.AccountID, false, attempt, appstats.RequestLogEntry{
 				StatusCode:    failure.StatusCode,
 				Error:         failure.Message,
 				FailureReason: string(failure.Reason),
 				BodySignal:    failure.BodySignal,
-			})
+			}))
 			s.recordFailure(req, failure)
 			return closeErr
 		}
 
 		success := observed.SuccessMeta(req, attempt)
 		_ = s.tokens.ReportSuccess(ctx, lease, success)
+		if stickyActive {
+			conversationID := observed.ConversationID()
+			if conversationID == "" {
+				conversationID = req.Metadata.ConversationID
+			}
+			if updated, ok := s.sessions.Update(req.Metadata.SessionKey, session.Update{
+				ConversationID:   conversationID,
+				AccountID:        lease.AccountID,
+				WorkingDirectory: req.Metadata.WorkingDirectory,
+				Model:            req.Model,
+				ContextUsagePct:  observed.ContextUsagePercentage(),
+				InputTokens:      success.InputTokens,
+				MessageCount:     len(req.Messages),
+				Touch:            true,
+			}); ok {
+				binding = updated
+			}
+			compactReason := ""
+			if observed.ShouldAutoCompact(s.autoCompactThreshold()) {
+				compactReason = "context_high"
+			}
+			if observed.WasTruncated() {
+				compactReason = "truncated"
+			}
+			if compactReason != "" {
+				req.Metadata.CompactReason = compactReason
+				s.recordCompactReason(compactReason)
+				binding = s.sessions.RotateWithReason(req.Metadata.SessionKey, req.Metadata.WorkingDirectory, compactReason)
+			}
+			_ = binding
+		}
 		if s.stats != nil {
 			s.stats.RecordSuccess(success)
 		}
-		s.recordRequestLog(appstats.RequestLogEntry{
-			RequestID:                req.Metadata.ClientRequestID,
-			Protocol:                 string(req.Protocol),
-			Endpoint:                 req.Metadata.Endpoint,
-			Model:                    req.Model,
-			AccountID:                lease.AccountID,
-			Success:                  true,
-			Attempts:                 attempt,
+		s.recordRequestLog(s.buildRequestLogEntry(req, lease.AccountID, true, attempt, appstats.RequestLogEntry{
 			StatusCode:               200,
 			InputTokens:              success.InputTokens,
 			OutputTokens:             success.OutputTokens,
@@ -210,7 +261,7 @@ func (s *Service) Handle(ctx context.Context, req message.UnifiedRequest, format
 			Credits:                  success.Credits,
 			CacheCreationInputTokens: success.CacheCreationInputTokens,
 			CacheReadInputTokens:     success.CacheReadInputTokens,
-		})
+		}))
 
 		// Save truncation info for recovery on the next request.
 		if observed.WasTruncated() {
@@ -257,6 +308,9 @@ func (s *Service) prepareRequestMetadata(req *message.UnifiedRequest) {
 	}
 
 	if req.Protocol != message.ProtocolAnthropic {
+		if strings.TrimSpace(req.Metadata.ChatTriggerType) == "" {
+			req.Metadata.ChatTriggerType = "MANUAL"
+		}
 		return
 	}
 
@@ -266,6 +320,9 @@ func (s *Service) prepareRequestMetadata(req *message.UnifiedRequest) {
 
 	req.Metadata.RemainingInputTokens = req.Metadata.EstimatedInputTokens
 	if req.Metadata.FakeCacheKey == 0 || s.cache == nil {
+		if strings.TrimSpace(req.Metadata.ChatTriggerType) == "" {
+			req.Metadata.ChatTriggerType = "MANUAL"
+		}
 		return
 	}
 
@@ -275,6 +332,72 @@ func (s *Service) prepareRequestMetadata(req *message.UnifiedRequest) {
 	req.Metadata.CacheCreationInputTokens = cacheCreation
 	req.Metadata.CacheReadInputTokens = cacheRead
 	req.Metadata.RemainingInputTokens = remaining
+	if strings.TrimSpace(req.Metadata.ChatTriggerType) == "" {
+		req.Metadata.ChatTriggerType = "MANUAL"
+	}
+}
+
+func (s *Service) prepareSessionBinding(req *message.UnifiedRequest) session.Binding {
+	if req == nil || s.sessions == nil || !req.Metadata.StickyEnabled || strings.TrimSpace(req.Metadata.SessionKey) == "" {
+		return session.Binding{}
+	}
+
+	workdir := strings.TrimSpace(req.Metadata.WorkingDirectory)
+	var binding session.Binding
+	if req.Metadata.CompactRequested {
+		req.Metadata.CompactReason = "manual"
+		binding = s.sessions.RotateWithReason(req.Metadata.SessionKey, workdir, req.Metadata.CompactReason)
+	} else if existing, ok := s.sessions.Get(req.Metadata.SessionKey); ok {
+		if s.shouldRotateForClientCompact(existing, *req) {
+			req.Metadata.CompactReason = "client_compacted"
+			binding = s.sessions.RotateWithReason(req.Metadata.SessionKey, workdir, req.Metadata.CompactReason)
+		} else {
+			binding = existing
+		}
+	} else {
+		binding = s.sessions.Ensure(req.Metadata.SessionKey, workdir)
+	}
+
+	req.Metadata.ConversationID = binding.ConversationID
+	req.Metadata.ConversationEpoch = binding.Epoch
+	req.Metadata.PreferredAccountID = binding.AccountID
+	return binding
+}
+
+func (s *Service) autoCompactThreshold() float64 {
+	if s.sessions == nil {
+		return 0.85
+	}
+	return s.sessions.ContextCompactThreshold()
+}
+
+func (s *Service) shouldRotateForClientCompact(binding session.Binding, req message.UnifiedRequest) bool {
+	currentMessages := len(req.Messages)
+	previousMessages := binding.LastMessageCount
+	messageDrop := previousMessages >= autoCompactMinHistoryMessages &&
+		currentMessages > 0 &&
+		float64(currentMessages) <= float64(previousMessages)*autoCompactMessageDropRatio
+
+	currentTokens := req.Metadata.EstimatedInputTokens
+	previousTokens := binding.LastInputTokens
+	tokenDrop := previousTokens >= autoCompactMinInputTokens &&
+		currentTokens > 0 &&
+		float64(currentTokens) <= float64(previousTokens)*autoCompactTokenDropRatio
+
+	return messageDrop || tokenDrop
+}
+
+func (s *Service) determinePayloadStrategy(req message.UnifiedRequest) string {
+	if !req.Metadata.StickyEnabled || strings.TrimSpace(req.Metadata.SessionKey) == "" {
+		return payloadStrategyReplay
+	}
+	if strings.TrimSpace(req.Metadata.CompactReason) != "" {
+		return payloadStrategyStickyCompact
+	}
+	if strings.TrimSpace(req.Metadata.PreferredAccountID) == "" {
+		return payloadStrategyReplaySeed
+	}
+	return payloadStrategyStickyFull
 }
 
 func failureMetaFromError(req message.UnifiedRequest, err error) account.FailureMeta {
@@ -330,5 +453,43 @@ func (s *Service) recordFailure(req message.UnifiedRequest, meta account.Failure
 func (s *Service) recordRequestLog(entry appstats.RequestLogEntry) {
 	if s.requestLogs != nil {
 		s.requestLogs.Add(entry)
+	}
+}
+
+func (s *Service) buildRequestLogEntry(req message.UnifiedRequest, accountID string, success bool, attempts int, extra appstats.RequestLogEntry) appstats.RequestLogEntry {
+	entry := appstats.RequestLogEntry{
+		RequestID:         req.Metadata.ClientRequestID,
+		Protocol:          string(req.Protocol),
+		Endpoint:          req.Metadata.Endpoint,
+		Model:             req.Model,
+		AccountID:         accountID,
+		APIKeyID:          req.Metadata.APIKeyID,
+		StickySession:     req.Metadata.StickyEnabled,
+		ConversationID:    req.Metadata.ConversationID,
+		ConversationEpoch: req.Metadata.ConversationEpoch,
+		CompactReason:     req.Metadata.CompactReason,
+		PayloadStrategy:   req.Metadata.PayloadStrategy,
+		CacheHit:          req.Metadata.CacheHit,
+		Success:           success,
+		Attempts:          attempts,
+	}
+	if extra.StatusCode != 0 {
+		entry.StatusCode = extra.StatusCode
+	}
+	entry.Error = extra.Error
+	entry.FailureReason = extra.FailureReason
+	entry.BodySignal = extra.BodySignal
+	entry.InputTokens = extra.InputTokens
+	entry.OutputTokens = extra.OutputTokens
+	entry.TotalTokens = extra.TotalTokens
+	entry.Credits = extra.Credits
+	entry.CacheCreationInputTokens = extra.CacheCreationInputTokens
+	entry.CacheReadInputTokens = extra.CacheReadInputTokens
+	return entry
+}
+
+func (s *Service) recordCompactReason(reason string) {
+	if s.stats != nil && strings.TrimSpace(reason) != "" {
+		s.stats.RecordCompact(reason)
 	}
 }

@@ -22,6 +22,9 @@ func TestCollectorAggregatesSuccessAndFailure(t *testing.T) {
 	collector.RecordFailure(account.FailureMeta{
 		Attempts: 3,
 	})
+	collector.RecordCompact("manual")
+	collector.RecordCompact("manual")
+	collector.RecordCompact("context_high")
 
 	snapshot := collector.Snapshot()
 	if snapshot.TotalRequests != 2 {
@@ -44,5 +47,8 @@ func TestCollectorAggregatesSuccessAndFailure(t *testing.T) {
 	}
 	if snapshot.TotalRetries != 3 {
 		t.Fatalf("expected 3 total retries, got %d", snapshot.TotalRetries)
+	}
+	if snapshot.CompactTriggers["manual"] != 2 || snapshot.CompactTriggers["context_high"] != 1 {
+		t.Fatalf("unexpected compact triggers: %+v", snapshot.CompactTriggers)
 	}
 }

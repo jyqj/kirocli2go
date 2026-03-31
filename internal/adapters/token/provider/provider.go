@@ -3,6 +3,7 @@ package provider
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"kirocli-go/internal/adapters/store/jsonfile"
 	"kirocli-go/internal/adapters/upstream/clihttp"
 	"kirocli-go/internal/domain/account"
+	"kirocli-go/internal/domain/device"
 	domainerrors "kirocli-go/internal/domain/errors"
 )
 
@@ -153,6 +155,7 @@ type tokenAccount struct {
 	Source        string
 	RemoteID      int
 	InPool        bool
+	HomeDir       string // virtual device home directory
 }
 
 type PoolSnapshot struct {
@@ -253,6 +256,13 @@ func (p *Provider) Acquire(ctx context.Context, hint account.AcquireHint) (accou
 	if len(preferred) == 0 {
 		preferred = candidates
 	}
+	if preferredID := strings.TrimSpace(hint.PreferredAccountID); preferredID != "" {
+		if sticky := pickAccountByID(preferred, preferredID); len(sticky) > 0 {
+			preferred = sticky
+		} else if sticky := pickAccountByID(candidates, preferredID); len(sticky) > 0 {
+			preferred = sticky
+		}
+	}
 
 	for attempts := 0; attempts < len(preferred); attempts++ {
 		item := pickWeightedAccount(preferred, p.rng.Intn(totalWeight(preferred)))
@@ -278,11 +288,15 @@ func (p *Provider) Acquire(ctx context.Context, hint account.AcquireHint) (accou
 			item.InPool = true
 			p.lastWarmAt = time.Now()
 		}
+		if item.HomeDir == "" {
+			item.HomeDir = device.ForAccount(item.ID).HomeDir
+		}
 		p.index++
 		return account.Lease{
 			AccountID: item.ID,
 			Token:     item.BearerToken,
 			Profile:   account.ProfileCLI,
+			HomeDir:   item.HomeDir,
 			Metadata: map[string]string{
 				"source": item.Source,
 			},
@@ -845,7 +859,7 @@ func (p *Provider) ensureBearer(item *tokenAccount, force bool) error {
 
 	var lastErr error
 	for attempt := 0; attempt < p.cfg.MaxRefreshTry; attempt++ {
-		req.Header.Set("Amz-Sdk-Invocation-Id", fmt.Sprintf("oidc-%d-%d", time.Now().UnixNano(), attempt))
+		req.Header.Set("Amz-Sdk-Invocation-Id", newInvocationID())
 
 		resp, err := p.httpClient.Do(req)
 		if err != nil {
@@ -1191,6 +1205,16 @@ func filterAccounts(items []*tokenAccount, id string) []*tokenAccount {
 	return result
 }
 
+func pickAccountByID(items []*tokenAccount, id string) []*tokenAccount {
+	result := make([]*tokenAccount, 0, 1)
+	for _, item := range items {
+		if item.ID == id {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
 func filterPoolAccounts(items []*tokenAccount, inPool bool) []*tokenAccount {
 	result := make([]*tokenAccount, 0, len(items))
 	for _, item := range items {
@@ -1373,4 +1397,26 @@ func (p *Provider) triggerImmediatePoolWarm() {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	_, _ = p.WarmPool(ctx)
+}
+
+func newInvocationID() string {
+	var b [16]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%08x-%04x-4%03x-8%03x-%012x",
+			uint32(time.Now().UnixNano()),
+			uint16(time.Now().UnixNano()>>32),
+			uint16(time.Now().UnixNano()>>16)&0x0FFF,
+			uint16(time.Now().UnixNano()>>8)&0x0FFF,
+			uint64(time.Now().UnixNano())&0xFFFFFFFFFFFF,
+		)
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		uint32(b[0])<<24|uint32(b[1])<<16|uint32(b[2])<<8|uint32(b[3]),
+		uint16(b[4])<<8|uint16(b[5]),
+		uint16(b[6])<<8|uint16(b[7]),
+		uint16(b[8])<<8|uint16(b[9]),
+		uint64(b[10])<<40|uint64(b[11])<<32|uint64(b[12])<<24|uint64(b[13])<<16|uint64(b[14])<<8|uint64(b[15]),
+	)
 }

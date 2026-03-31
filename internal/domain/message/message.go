@@ -39,6 +39,18 @@ type UnifiedRequest struct {
 type RequestMetadata struct {
 	ClientRequestID          string
 	Endpoint                 string
+	APIKeyID                 string
+	SessionKey               string
+	ConversationID           string
+	ConversationEpoch        int
+	PreferredAccountID       string
+	WorkingDirectory         string
+	ChatTriggerType          string
+	StickyEnabled            bool
+	CompactRequested         bool
+	CompactReason            string
+	PayloadStrategy          string
+	FakeCacheNamespace       string
 	EstimatedInputTokens     int
 	FakeCacheKey             uint64
 	CacheHit                 bool

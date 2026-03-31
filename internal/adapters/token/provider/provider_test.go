@@ -256,6 +256,34 @@ func TestWarmPoolMarksAccountsInPool(t *testing.T) {
 	}
 }
 
+func TestAcquirePrefersStickyAccountID(t *testing.T) {
+	provider, err := New(Config{
+		Source:      "env",
+		BearerToken: "env-bearer",
+	})
+	if err != nil {
+		t.Fatalf("New provider error: %v", err)
+	}
+
+	if _, err := provider.ImportAccount(context.Background(), ImportRequest{
+		ID:          "managed-preferred",
+		BearerToken: "managed-bearer",
+	}); err != nil {
+		t.Fatalf("ImportAccount error: %v", err)
+	}
+
+	lease, err := provider.Acquire(context.Background(), account.AcquireHint{
+		Profile:            account.ProfileCLI,
+		PreferredAccountID: "managed-preferred",
+	})
+	if err != nil {
+		t.Fatalf("Acquire error: %v", err)
+	}
+	if lease.AccountID != "managed-preferred" {
+		t.Fatalf("expected preferred account, got %s", lease.AccountID)
+	}
+}
+
 func TestWarmPoolFetchesAdditionalAPIAccounts(t *testing.T) {
 	var fetchCount atomic.Int64
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -8,9 +8,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	runtimecatalog "kirocli-go/internal/adapters/catalog/runtime"
 	"kirocli-go/internal/adapters/token/provider"
+	"kirocli-go/internal/application/apikey"
+	"kirocli-go/internal/application/chat"
+	"kirocli-go/internal/application/session"
 	appstats "kirocli-go/internal/application/stats"
 	"kirocli-go/internal/config"
 	"kirocli-go/internal/domain/model"
@@ -38,6 +42,16 @@ type Handler struct {
 		Refresh(ctx context.Context) (int, error)
 		Snapshot() runtimecatalog.Snapshot
 	}
+	sessions interface {
+		Snapshot() session.Snapshot
+	}
+	apiKeys interface {
+		Snapshots() []apikey.Snapshot
+		Required() bool
+	}
+	cache interface {
+		Snapshot() chat.FakeCacheSnapshot
+	}
 }
 
 func NewHandler(
@@ -62,6 +76,16 @@ func NewHandler(
 		Refresh(ctx context.Context) (int, error)
 		Snapshot() runtimecatalog.Snapshot
 	},
+	sessionManager interface {
+		Snapshot() session.Snapshot
+	},
+	apiKeyManager interface {
+		Snapshots() []apikey.Snapshot
+		Required() bool
+	},
+	fakeCache interface {
+		Snapshot() chat.FakeCacheSnapshot
+	},
 ) *Handler {
 	return &Handler{
 		cfg:         cfg,
@@ -69,6 +93,9 @@ func NewHandler(
 		requestLogs: requestLogs,
 		provider:    accountProvider,
 		catalog:     modelCatalog,
+		sessions:    sessionManager,
+		apiKeys:     apiKeyManager,
+		cache:       fakeCache,
 	}
 }
 
@@ -85,6 +112,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleDoctor(w)
 	case path == "/accounts" && r.Method == http.MethodGet:
 		h.handleAccounts(w)
+	case path == "/keys" && r.Method == http.MethodGet:
+		h.handleKeys(w)
 	case path == "/accounts/import" && r.Method == http.MethodPost:
 		h.handleImport(w, r)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/disable") && r.Method == http.MethodPost:
@@ -109,6 +138,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleRefreshPool(w, r)
 	case path == "/request-logs" && r.Method == http.MethodGet:
 		h.handleRequestLogs(w, r)
+	case path == "/dashboard" && r.Method == http.MethodGet:
+		h.handleDashboard(w)
 	case path == "/status" && r.Method == http.MethodGet:
 		h.handleStatus(w)
 	default:
@@ -146,6 +177,18 @@ func (h *Handler) handleConfig(w http.ResponseWriter) {
 			"cli_models_url": h.cfg.Upstream.CLIModelsURL,
 			"cli_origin":     h.cfg.Upstream.CLIOrigin,
 		},
+		"sessions": map[string]any{
+			"sticky_enabled":                 h.cfg.Session.StickyEnabled,
+			"ttl_seconds":                    int64(h.cfg.Session.TTL.Seconds()),
+			"sweep_interval_seconds":         int64(h.cfg.Session.SweepInterval.Seconds()),
+			"max_entries":                    h.cfg.Session.MaxEntries,
+			"auto_compact_context_threshold": h.cfg.Session.AutoCompactContextThreshold,
+		},
+		"security": map[string]any{
+			"api_key_required": h.apiKeys != nil && h.apiKeys.Required(),
+			"api_keys_count":   len(h.keySnapshots()),
+		},
+		"fake_cache": h.cacheSnapshot(),
 	})
 }
 
@@ -174,12 +217,15 @@ func (h *Handler) handleDoctor(w http.ResponseWriter) {
 		"status": "ok",
 		"checks": checks,
 		"runtime": map[string]any{
-			"version":               config.Version,
-			"account_source":        h.cfg.Accounts.Source,
-			"account_configured":    accountConfigured,
-			"model_refresh_enabled": h.cfg.Background.ModelRefreshEnabled,
-			"state_persist_enabled": h.cfg.State.PersistEnabled,
+			"version":                config.Version,
+			"account_source":         h.cfg.Accounts.Source,
+			"account_configured":     accountConfigured,
+			"model_refresh_enabled":  h.cfg.Background.ModelRefreshEnabled,
+			"state_persist_enabled":  h.cfg.State.PersistEnabled,
+			"session_sticky_enabled": h.cfg.Session.StickyEnabled,
+			"api_key_required":       h.apiKeys != nil && h.apiKeys.Required(),
 		},
+		"fake_cache": h.cacheSnapshot(),
 	})
 }
 
@@ -227,6 +273,13 @@ func (h *Handler) handleAccounts(w http.ResponseWriter) {
 	})
 }
 
+func (h *Handler) handleKeys(w http.ResponseWriter) {
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"required": h.apiKeys != nil && h.apiKeys.Required(),
+		"keys":     h.keySnapshots(),
+	})
+}
+
 func (h *Handler) handleRequestLogs(w http.ResponseWriter, r *http.Request) {
 	limit := 100
 	offset := 0
@@ -249,15 +302,19 @@ func (h *Handler) handleRequestLogs(w http.ResponseWriter, r *http.Request) {
 	entries := []appstats.RequestLogEntry{}
 	if h.requestLogs != nil {
 		entries = h.requestLogs.Query(appstats.RequestLogQuery{
-			Limit:         limit,
-			Offset:        offset,
-			Protocol:      strings.TrimSpace(r.URL.Query().Get("protocol")),
-			Endpoint:      strings.TrimSpace(r.URL.Query().Get("endpoint")),
-			Model:         strings.TrimSpace(r.URL.Query().Get("model")),
-			AccountID:     strings.TrimSpace(r.URL.Query().Get("account_id")),
-			Success:       successPtr,
-			FailureReason: strings.TrimSpace(r.URL.Query().Get("failure_reason")),
-			BodySignal:    strings.TrimSpace(r.URL.Query().Get("body_signal")),
+			Limit:           limit,
+			Offset:          offset,
+			Protocol:        strings.TrimSpace(r.URL.Query().Get("protocol")),
+			Endpoint:        strings.TrimSpace(r.URL.Query().Get("endpoint")),
+			Model:           strings.TrimSpace(r.URL.Query().Get("model")),
+			AccountID:       strings.TrimSpace(r.URL.Query().Get("account_id")),
+			APIKeyID:        strings.TrimSpace(r.URL.Query().Get("api_key_id")),
+			ConversationID:  strings.TrimSpace(r.URL.Query().Get("conversation_id")),
+			CompactReason:   strings.TrimSpace(r.URL.Query().Get("compact_reason")),
+			PayloadStrategy: strings.TrimSpace(r.URL.Query().Get("payload_strategy")),
+			Success:         successPtr,
+			FailureReason:   strings.TrimSpace(r.URL.Query().Get("failure_reason")),
+			BodySignal:      strings.TrimSpace(r.URL.Query().Get("body_signal")),
 		})
 	}
 
@@ -267,6 +324,14 @@ func (h *Handler) handleRequestLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleStatus(w http.ResponseWriter) {
+	_ = json.NewEncoder(w).Encode(h.buildDashboardPayload(0))
+}
+
+func (h *Handler) handleDashboard(w http.ResponseWriter) {
+	_ = json.NewEncoder(w).Encode(h.buildDashboardPayload(10))
+}
+
+func (h *Handler) buildDashboardPayload(recentLimit int) map[string]any {
 	accountCount := 0
 	activeCount := 0
 	byStatus := map[string]int{
@@ -297,8 +362,33 @@ func (h *Handler) handleStatus(w http.ResponseWriter) {
 	if h.provider != nil {
 		pool = h.provider.PoolSnapshot()
 	}
+	sessionSnapshot := session.Snapshot{}
+	if h.sessions != nil {
+		sessionSnapshot = h.sessions.Snapshot()
+	}
+	cacheSnapshot := h.cacheSnapshot()
+	compactTotal := int64(0)
+	for _, value := range snapshot.CompactTriggers {
+		compactTotal += value
+	}
 
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	recentLogs := []appstats.RequestLogEntry{}
+	recentFailures := 0
+	if h.requestLogs != nil && recentLimit > 0 {
+		recentLogs = h.requestLogs.List(recentLimit)
+		for _, entry := range recentLogs {
+			if !entry.Success {
+				recentFailures++
+			}
+		}
+	}
+
+	catalogSnapshot := runtimecatalog.Snapshot{}
+	if h.catalog != nil {
+		catalogSnapshot = h.catalog.Snapshot()
+	}
+
+	return map[string]any{
 		"status":    "ok",
 		"accounts":  accountCount,
 		"active":    activeCount,
@@ -309,9 +399,69 @@ func (h *Handler) handleStatus(w http.ResponseWriter) {
 			"disabled": "被管理员禁用或删除的账号",
 			"banned":   "因风控或上游封禁被永久停用的账号",
 		},
-		"stats": snapshot,
-		"pool":  pool,
-	})
+		"stats":      snapshot,
+		"pool":       pool,
+		"sessions":   sessionSnapshot,
+		"fake_cache": cacheSnapshot,
+		"security": map[string]any{
+			"api_key_required": h.apiKeys != nil && h.apiKeys.Required(),
+			"api_keys_count":   len(h.keySnapshots()),
+		},
+		"dashboard": map[string]any{
+			"generated_at_unix": time.Now().Unix(),
+			"summary": map[string]any{
+				"accounts_total":        accountCount,
+				"accounts_active":       activeCount,
+				"requests_total":        snapshot.TotalRequests,
+				"requests_success":      snapshot.SuccessRequests,
+				"requests_failed":       snapshot.FailedRequests,
+				"credits_total":         snapshot.TotalCredits,
+				"sessions_active":       sessionSnapshot.ActiveSessions,
+				"fake_cache_hit_rate":   cacheSnapshot.HitRate,
+				"fake_cache_hits":       cacheSnapshot.Hits,
+				"fake_cache_lookups":    cacheSnapshot.Lookups,
+				"compact_total":         compactTotal,
+				"pool_warmed_accounts":  pool.WarmedAccounts,
+				"pool_target_size":      pool.TargetSize,
+				"catalog_models_cached": len(catalogSnapshot.Models),
+			},
+			"sections": map[string]any{
+				"accounts": map[string]any{
+					"total":     accountCount,
+					"active":    activeCount,
+					"by_status": byStatus,
+				},
+				"pool":       pool,
+				"stats":      snapshot,
+				"sessions":   sessionSnapshot,
+				"fake_cache": cacheSnapshot,
+				"catalog":    catalogSnapshot,
+				"security": map[string]any{
+					"api_key_required": h.apiKeys != nil && h.apiKeys.Required(),
+				},
+				"recent": map[string]any{
+					"entries":          recentLogs,
+					"failure_count":    recentFailures,
+					"returned":         len(recentLogs),
+					"compact_triggers": snapshot.CompactTriggers,
+				},
+			},
+		},
+	}
+}
+
+func (h *Handler) keySnapshots() []apikey.Snapshot {
+	if h.apiKeys == nil {
+		return nil
+	}
+	return h.apiKeys.Snapshots()
+}
+
+func (h *Handler) cacheSnapshot() chat.FakeCacheSnapshot {
+	if h.cache == nil {
+		return chat.FakeCacheSnapshot{}
+	}
+	return h.cache.Snapshot()
 }
 
 func (h *Handler) handleImport(w http.ResponseWriter, r *http.Request) {

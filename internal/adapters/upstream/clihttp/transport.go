@@ -3,6 +3,8 @@ package clihttp
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha1"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -10,16 +12,18 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/proxy"
 
+	"kirocli-go/internal/domain/device"
 	domainerrors "kirocli-go/internal/domain/errors"
 	"kirocli-go/internal/domain/message"
-	"kirocli-go/internal/domain/truncation"
 	"kirocli-go/internal/domain/stream"
+	"kirocli-go/internal/domain/truncation"
 	"kirocli-go/internal/ports"
 )
 
@@ -135,22 +139,37 @@ func (c *Client) BuildRequest(ctx context.Context, req ports.UpstreamRequest) (*
 	}
 
 	httpReq.Header.Set("Content-Type", "application/x-amz-json-1.0")
-	httpReq.Header.Set("Accept", "*/*")
+	httpReq.Header.Set("X-Amz-Target", c.cfg.Target)
 	httpReq.Header.Set("User-Agent", c.cfg.UserAgent)
 	httpReq.Header.Set("X-Amz-User-Agent", c.cfg.AmzUserAgent)
-	httpReq.Header.Set("X-Amz-Target", c.cfg.Target)
+	httpReq.Header.Set("X-Amzn-Codewhisperer-Optout", "false")
 	httpReq.Header.Set("Authorization", "Bearer "+req.Lease.Token)
-	httpReq.Header.Set("X-Amzn-Codewhisperer-Optout", "true")
 	httpReq.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
-	httpReq.Header.Set("Amz-Sdk-Invocation-Id", fmt.Sprintf("inv-%d", time.Now().UnixNano()))
+	httpReq.Header.Set("Amz-Sdk-Invocation-Id", newConversationID())
+	httpReq.Header.Set("Accept", "*/*")
+	httpReq.Header.Set("Accept-Encoding", "gzip")
 
 	return httpReq, nil
 }
 
 func (c *Client) buildPayload(req ports.UpstreamRequest) (map[string]any, error) {
+	var devID device.Identity
+	if req.Lease.HomeDir != "" {
+		devID = device.Identity{
+			Username: filepath.Base(req.Lease.HomeDir),
+			HomeDir:  req.Lease.HomeDir,
+		}
+	} else {
+		devID = device.ForAccount(req.Lease.AccountID)
+	}
+	workingDirectory := device.EffectiveWorkdir(
+		devID,
+		req.Request.Metadata.SessionKey,
+		req.Request.Metadata.WorkingDirectory,
+	)
 	envState := map[string]any{
 		"operatingSystem":         "macos",
-		"currentWorkingDirectory": ".",
+		"currentWorkingDirectory": workingDirectory,
 	}
 
 	items := make([]map[string]any, 0, len(req.Request.Messages)+2)
@@ -176,6 +195,7 @@ func (c *Client) buildPayload(req ports.UpstreamRequest) (map[string]any, error)
 		"envState": envState,
 	}
 	longToolDocs := ""
+	payloadStrategy := strings.TrimSpace(req.Request.Metadata.PayloadStrategy)
 
 	if len(req.Request.Tools) > 0 {
 		var tools []map[string]any
@@ -202,6 +222,11 @@ func (c *Client) buildPayload(req ports.UpstreamRequest) (map[string]any, error)
 		}
 	}
 
+	history = applyPayloadStrategy(history, payloadStrategy, strings.TrimSpace(req.Request.SystemPrompt) != "")
+	if payloadStrategy == "sticky_compact" {
+		currentContext = enrichCompactContext(currentContext, workingDirectory)
+	}
+
 	currentContent = applyTranslatorRules(currentContent, longToolDocs, req.Model.ThinkingEnabled)
 
 	currentMessage := map[string]any{
@@ -214,16 +239,69 @@ func (c *Client) buildPayload(req ports.UpstreamRequest) (map[string]any, error)
 		currentMessage["images"] = currentImages
 	}
 
-	return map[string]any{
-		"conversationState": map[string]any{
-			"conversationId":  fmt.Sprintf("conv-%d", time.Now().UnixNano()),
-			"chatTriggerType": "MANUAL",
-			"history":         history,
-			"currentMessage": map[string]any{
-				"userInputMessage": currentMessage,
-			},
+	conversationID := strings.TrimSpace(req.Request.Metadata.ConversationID)
+	if conversationID == "" {
+		conversationID = newConversationID()
+	}
+	chatTriggerType := strings.TrimSpace(req.Request.Metadata.ChatTriggerType)
+	if chatTriggerType == "" {
+		chatTriggerType = "MANUAL"
+	}
+
+	conversationState := map[string]any{
+		"conversationId":  conversationID,
+		"chatTriggerType": chatTriggerType,
+		"history":         history,
+		"currentMessage": map[string]any{
+			"userInputMessage": currentMessage,
 		},
+		"agentContinuationId": newConversationID(),
+		"agentTaskType":       "vibe",
+	}
+	if workspaceID := workspaceIDFrom(workingDirectory); workspaceID != "" {
+		conversationState["workspaceId"] = workspaceID
+	}
+
+	return map[string]any{
+		"conversationState": conversationState,
 	}, nil
+}
+
+func applyPayloadStrategy(history []map[string]any, strategy string, hasSystem bool) []map[string]any {
+	switch strings.TrimSpace(strategy) {
+	case "sticky_compact":
+		return trimHistoryWithSystem(history, hasSystem, 0)
+	default:
+		return history
+	}
+}
+
+func trimHistoryWithSystem(history []map[string]any, hasSystem bool, tailLimit int) []map[string]any {
+	if len(history) == 0 {
+		return history
+	}
+
+	systemPrefix := 0
+	if hasSystem && len(history) >= 2 {
+		systemPrefix = 2
+	}
+
+	prefix := history[:systemPrefix]
+	rest := history[systemPrefix:]
+	if tailLimit <= 0 {
+		result := make([]map[string]any, len(prefix))
+		copy(result, prefix)
+		return result
+	}
+	if len(rest) <= tailLimit {
+		return history
+	}
+
+	start := len(rest) - tailLimit
+	result := make([]map[string]any, 0, len(prefix)+tailLimit)
+	result = append(result, prefix...)
+	result = append(result, rest[start:]...)
+	return result
 }
 
 func (c *Client) convertMessage(msg message.UnifiedMessage, envState map[string]any) []map[string]any {
@@ -397,8 +475,7 @@ func userHistoryItem(content string, images []map[string]any, toolResults []map[
 func assistantHistoryItem(content string, toolUses []map[string]any) map[string]any {
 	item := map[string]any{
 		"assistantResponseMessage": map[string]any{
-			"messageId": fmt.Sprintf("msg-%d", time.Now().UnixNano()),
-			"content":   ensureNonEmpty(content),
+			"content": ensureNonEmpty(content),
 		},
 	}
 	if len(toolUses) > 0 {
@@ -572,6 +649,18 @@ func (s *eventStream) Next(ctx context.Context) (stream.Event, error) {
 		}
 
 		switch eventType {
+		case "initial-response":
+			conversationID, _ := event["conversationId"].(string)
+			if conversationID == "" {
+				conversationID, _ = event["conversation_id"].(string)
+			}
+			if conversationID == "" {
+				continue
+			}
+			return stream.Event{
+				Type:           stream.EventTypeMetadata,
+				ConversationID: conversationID,
+			}, nil
 		case "assistantResponseEvent":
 			text, _ := event["content"].(string)
 			if text == "" {
@@ -619,6 +708,18 @@ func (s *eventStream) Next(ctx context.Context) (stream.Event, error) {
 					CacheWriteTokens: int(cacheWrite),
 				},
 			}, nil
+		case "contextUsageEvent":
+			percentage, _ := event["contextUsagePercentage"].(float64)
+			if percentage == 0 {
+				percentage, _ = event["context_usage_percentage"].(float64)
+			}
+			if percentage == 0 {
+				continue
+			}
+			return stream.Event{
+				Type:                   stream.EventTypeMetadata,
+				ContextUsagePercentage: percentage,
+			}, nil
 		case "meteringEvent":
 			credits, _ := event["usage"].(float64)
 			return stream.Event{
@@ -643,6 +744,88 @@ func (s *eventStream) Next(ctx context.Context) (stream.Event, error) {
 			}
 		}
 	}
+}
+
+func newConversationID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		now := time.Now().UnixNano()
+		return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+			uint32(now>>32),
+			uint16(now>>16),
+			uint16(now),
+			uint16(now>>8),
+			uint64(now)&0xFFFFFFFFFFFF,
+		)
+	}
+
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		uint32(b[0])<<24|uint32(b[1])<<16|uint32(b[2])<<8|uint32(b[3]),
+		uint16(b[4])<<8|uint16(b[5]),
+		uint16(b[6])<<8|uint16(b[7]),
+		uint16(b[8])<<8|uint16(b[9]),
+		uint64(b[10])<<40|uint64(b[11])<<32|uint64(b[12])<<24|uint64(b[13])<<16|uint64(b[14])<<8|uint64(b[15]),
+	)
+}
+
+func workspaceIDFrom(workingDirectory string) string {
+	workingDirectory = strings.TrimSpace(workingDirectory)
+	if workingDirectory == "" || workingDirectory == "." {
+		return ""
+	}
+	cleaned := filepath.Clean(workingDirectory)
+	sum := sha1.Sum([]byte(strings.ToLower(cleaned)))
+	var b [16]byte
+	copy(b[:], sum[:16])
+	b[6] = (b[6] & 0x0f) | 0x50
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		uint32(b[0])<<24|uint32(b[1])<<16|uint32(b[2])<<8|uint32(b[3]),
+		uint16(b[4])<<8|uint16(b[5]),
+		uint16(b[6])<<8|uint16(b[7]),
+		uint16(b[8])<<8|uint16(b[9]),
+		uint64(b[10])<<40|uint64(b[11])<<32|uint64(b[12])<<24|uint64(b[13])<<16|uint64(b[14])<<8|uint64(b[15]),
+	)
+}
+
+func enrichCompactContext(context map[string]any, workingDirectory string) map[string]any {
+	if context == nil {
+		context = make(map[string]any)
+	}
+	if _, ok := context["gitState"]; !ok {
+		context["gitState"] = map[string]any{}
+	}
+	if _, ok := context["editorStates"]; !ok {
+		context["editorStates"] = []map[string]any{}
+	}
+	if _, ok := context["shellState"]; !ok {
+		context["shellState"] = map[string]any{
+			"currentWorkingDirectory": workingDirectory,
+		}
+	}
+	if _, ok := context["diagnostic"]; !ok {
+		context["diagnostic"] = map[string]any{}
+	}
+	if _, ok := context["consoleState"]; !ok {
+		context["consoleState"] = map[string]any{}
+	}
+	if _, ok := context["userSettings"]; !ok {
+		context["userSettings"] = map[string]any{}
+	}
+	if _, ok := context["additionalContext"]; !ok {
+		context["additionalContext"] = []map[string]any{}
+	}
+	if _, ok := context["appStudioContext"]; !ok {
+		context["appStudioContext"] = map[string]any{
+			"cursorState":          map[string]any{},
+			"relevantDocuments":    []map[string]any{},
+			"useRelevantDocuments": false,
+		}
+	}
+	return context
 }
 
 func (s *eventStream) Close() error {

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	httpshared "kirocli-go/internal/adapters/http/shared"
+	"kirocli-go/internal/application/apikey"
 	"kirocli-go/internal/application/chat"
 	domainerrors "kirocli-go/internal/domain/errors"
 	"kirocli-go/internal/domain/message"
@@ -75,6 +77,8 @@ func toUnifiedRequest(req ChatCompletionRequest, r *http.Request) (message.Unifi
 	systemPrompts := make([]string, 0, 2)
 	messagesOut := make([]message.UnifiedMessage, 0, len(req.Messages))
 	tools := make([]message.UnifiedTool, 0, len(req.Tools))
+	sessionKey := httpshared.SessionKeyFrom(r)
+	principal, _ := apikey.PrincipalFromContext(r.Context())
 
 	for _, tool := range req.Tools {
 		if tool.Type != "" && tool.Type != "function" {
@@ -136,8 +140,15 @@ func toUnifiedRequest(req ChatCompletionRequest, r *http.Request) (message.Unifi
 		Messages:     messagesOut,
 		Tools:        tools,
 		Metadata: message.RequestMetadata{
-			ClientRequestID: requestIDFrom(r),
-			Endpoint:        r.URL.Path,
+			ClientRequestID:    requestIDFrom(r),
+			Endpoint:           r.URL.Path,
+			APIKeyID:           principal.ID,
+			SessionKey:         sessionKey,
+			WorkingDirectory:   httpshared.WorkingDirectoryFrom(r),
+			CompactRequested:   httpshared.CompactRequestedFrom(r),
+			StickyEnabled:      strings.TrimSpace(sessionKey) != "",
+			ChatTriggerType:    "MANUAL",
+			FakeCacheNamespace: principal.CacheNamespace,
 		},
 	}, nil
 }

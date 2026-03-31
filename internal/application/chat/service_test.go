@@ -5,6 +5,7 @@ import (
 	"io"
 	"testing"
 
+	"kirocli-go/internal/application/session"
 	appstats "kirocli-go/internal/application/stats"
 	"kirocli-go/internal/domain/account"
 	domainerrors "kirocli-go/internal/domain/errors"
@@ -123,6 +124,63 @@ func (f *stubFormatter) FormatJSON(ctx context.Context, req message.UnifiedReque
 	return nil
 }
 
+type drainingFormatter struct{}
+
+func (f *drainingFormatter) FormatStream(ctx context.Context, req message.UnifiedRequest, upstream ports.UpstreamStream, w io.Writer) error {
+	_, _ = w.Write(nil)
+	for {
+		_, err := upstream.Next(ctx)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (f *drainingFormatter) FormatJSON(ctx context.Context, req message.UnifiedRequest, upstream ports.UpstreamStream, w io.Writer) error {
+	return f.FormatStream(ctx, req, upstream, w)
+}
+
+type stickyTokenProvider struct {
+	hints    []account.AcquireHint
+	accounts []string
+}
+
+func (p *stickyTokenProvider) Acquire(ctx context.Context, hint account.AcquireHint) (account.Lease, error) {
+	_ = ctx
+	p.hints = append(p.hints, hint)
+	accountID := "account-1"
+	if len(p.accounts) > 0 {
+		accountID = p.accounts[0]
+		p.accounts = p.accounts[1:]
+	}
+	return account.Lease{
+		AccountID: accountID,
+		Token:     "token-" + accountID,
+		Profile:   account.ProfileCLI,
+	}, nil
+}
+
+func (p *stickyTokenProvider) ReportSuccess(ctx context.Context, lease account.Lease, meta account.SuccessMeta) error {
+	return nil
+}
+
+func (p *stickyTokenProvider) ReportFailure(ctx context.Context, lease account.Lease, meta account.FailureMeta) error {
+	return nil
+}
+
+type stickyCaptureUpstream struct {
+	requests []ports.UpstreamRequest
+}
+
+func (u *stickyCaptureUpstream) Send(ctx context.Context, req ports.UpstreamRequest) (ports.UpstreamStream, error) {
+	_ = ctx
+	u.requests = append(u.requests, req)
+	return &stubStream{}, nil
+}
+
 func TestHandleRetriesRetryableSendError(t *testing.T) {
 	tokens := &stubTokenProvider{}
 	upstream := &stubUpstream{}
@@ -204,5 +262,179 @@ func TestHandleRecordsBodySignalInRequestLog(t *testing.T) {
 	}
 	if tokens.lastFailure.BodySignal != "TEMPORARILY_SUSPENDED" {
 		t.Fatalf("expected failure meta signal TEMPORARILY_SUSPENDED, got %q", tokens.lastFailure.BodySignal)
+	}
+}
+
+func TestHandleStickySessionReusesConversationAndSupportsManualCompact(t *testing.T) {
+	tokens := &stickyTokenProvider{accounts: []string{"account-1", "account-1", "account-1"}}
+	upstream := &stickyCaptureUpstream{}
+	formatter := &drainingFormatter{}
+	sessions := session.New(session.Config{Enabled: true})
+
+	service, err := NewService(Dependencies{
+		Tokens:             tokens,
+		Upstream:           upstream,
+		Catalog:            &stubCatalog{},
+		Sessions:           sessions,
+		OpenAIFormatter:    formatter,
+		AnthropicFormatter: formatter,
+	})
+	if err != nil {
+		t.Fatalf("NewService error: %v", err)
+	}
+
+	req := message.UnifiedRequest{
+		Protocol: message.ProtocolOpenAI,
+		Model:    "claude-sonnet-4.5",
+		Metadata: message.RequestMetadata{
+			SessionKey:    "sess-1",
+			StickyEnabled: true,
+		},
+	}
+
+	if err := service.Handle(context.Background(), req, ports.ResponseFormatOpenAI, io.Discard); err != nil {
+		t.Fatalf("first Handle error: %v", err)
+	}
+	if err := service.Handle(context.Background(), req, ports.ResponseFormatOpenAI, io.Discard); err != nil {
+		t.Fatalf("second Handle error: %v", err)
+	}
+
+	if len(upstream.requests) != 2 {
+		t.Fatalf("expected 2 upstream requests, got %d", len(upstream.requests))
+	}
+	firstConversation := upstream.requests[0].Request.Metadata.ConversationID
+	secondConversation := upstream.requests[1].Request.Metadata.ConversationID
+	if firstConversation == "" || secondConversation == "" {
+		t.Fatal("expected conversation ids to be assigned")
+	}
+	if firstConversation != secondConversation {
+		t.Fatalf("expected sticky conversation reuse, got %s and %s", firstConversation, secondConversation)
+	}
+	if tokens.hints[1].PreferredAccountID != "account-1" {
+		t.Fatalf("expected preferred account account-1, got %q", tokens.hints[1].PreferredAccountID)
+	}
+
+	req.Metadata.CompactRequested = true
+	if err := service.Handle(context.Background(), req, ports.ResponseFormatOpenAI, io.Discard); err != nil {
+		t.Fatalf("compact Handle error: %v", err)
+	}
+	thirdConversation := upstream.requests[2].Request.Metadata.ConversationID
+	if thirdConversation == firstConversation {
+		t.Fatalf("expected manual compact to rotate conversation, still got %s", thirdConversation)
+	}
+}
+
+func TestHandleStickySessionRotatesConversationWhenAccountChanges(t *testing.T) {
+	tokens := &stickyTokenProvider{accounts: []string{"account-1", "account-2"}}
+	upstream := &stickyCaptureUpstream{}
+	formatter := &drainingFormatter{}
+	sessions := session.New(session.Config{Enabled: true})
+
+	service, err := NewService(Dependencies{
+		Tokens:             tokens,
+		Upstream:           upstream,
+		Catalog:            &stubCatalog{},
+		Sessions:           sessions,
+		OpenAIFormatter:    formatter,
+		AnthropicFormatter: formatter,
+	})
+	if err != nil {
+		t.Fatalf("NewService error: %v", err)
+	}
+
+	req := message.UnifiedRequest{
+		Protocol: message.ProtocolOpenAI,
+		Model:    "claude-sonnet-4.5",
+		Metadata: message.RequestMetadata{
+			SessionKey:    "sess-rotate",
+			StickyEnabled: true,
+		},
+	}
+
+	if err := service.Handle(context.Background(), req, ports.ResponseFormatOpenAI, io.Discard); err != nil {
+		t.Fatalf("first Handle error: %v", err)
+	}
+	if err := service.Handle(context.Background(), req, ports.ResponseFormatOpenAI, io.Discard); err != nil {
+		t.Fatalf("second Handle error: %v", err)
+	}
+
+	if len(upstream.requests) != 2 {
+		t.Fatalf("expected 2 upstream requests, got %d", len(upstream.requests))
+	}
+	if upstream.requests[0].Request.Metadata.ConversationID == upstream.requests[1].Request.Metadata.ConversationID {
+		t.Fatal("expected account change to rotate conversation")
+	}
+	if tokens.hints[1].PreferredAccountID != "account-1" {
+		t.Fatalf("expected previous account to be preferred on second attempt, got %q", tokens.hints[1].PreferredAccountID)
+	}
+}
+
+func TestHandleStickySessionAutoRotatesWhenClientAppearsCompacted(t *testing.T) {
+	tokens := &stickyTokenProvider{accounts: []string{"account-1", "account-1"}}
+	upstream := &stickyCaptureUpstream{}
+	formatter := &drainingFormatter{}
+	sessions := session.New(session.Config{Enabled: true})
+
+	service, err := NewService(Dependencies{
+		Tokens:             tokens,
+		Upstream:           upstream,
+		Catalog:            &stubCatalog{},
+		Sessions:           sessions,
+		OpenAIFormatter:    formatter,
+		AnthropicFormatter: formatter,
+	})
+	if err != nil {
+		t.Fatalf("NewService error: %v", err)
+	}
+
+	manyMessages := make([]message.UnifiedMessage, 0, 20)
+	for i := 0; i < 20; i++ {
+		role := message.RoleUser
+		if i%2 == 1 {
+			role = message.RoleAssistant
+		}
+		manyMessages = append(manyMessages, message.UnifiedMessage{
+			Role:  role,
+			Parts: []message.Part{{Type: message.PartTypeText, Text: "turn"}},
+		})
+	}
+
+	firstReq := message.UnifiedRequest{
+		Protocol: message.ProtocolAnthropic,
+		Model:    "claude-sonnet-4.5",
+		Messages: manyMessages,
+		Metadata: message.RequestMetadata{
+			SessionKey:           "sess-auto-compact",
+			StickyEnabled:        true,
+			EstimatedInputTokens: 8000,
+		},
+	}
+	if err := service.Handle(context.Background(), firstReq, ports.ResponseFormatAnthropic, io.Discard); err != nil {
+		t.Fatalf("first Handle error: %v", err)
+	}
+
+	secondReq := message.UnifiedRequest{
+		Protocol: message.ProtocolAnthropic,
+		Model:    "claude-sonnet-4.5",
+		Messages: []message.UnifiedMessage{
+			{Role: message.RoleUser, Parts: []message.Part{{Type: message.PartTypeText, Text: "compacted"}}},
+			{Role: message.RoleAssistant, Parts: []message.Part{{Type: message.PartTypeText, Text: "summary"}}},
+			{Role: message.RoleUser, Parts: []message.Part{{Type: message.PartTypeText, Text: "continue"}}},
+		},
+		Metadata: message.RequestMetadata{
+			SessionKey:           "sess-auto-compact",
+			StickyEnabled:        true,
+			EstimatedInputTokens: 1200,
+		},
+	}
+	if err := service.Handle(context.Background(), secondReq, ports.ResponseFormatAnthropic, io.Discard); err != nil {
+		t.Fatalf("second Handle error: %v", err)
+	}
+
+	if len(upstream.requests) != 2 {
+		t.Fatalf("expected 2 upstream requests, got %d", len(upstream.requests))
+	}
+	if upstream.requests[0].Request.Metadata.ConversationID == upstream.requests[1].Request.Metadata.ConversationID {
+		t.Fatal("expected auto compact heuristic to rotate conversation")
 	}
 }

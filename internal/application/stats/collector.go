@@ -1,6 +1,7 @@
 package stats
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -9,16 +10,17 @@ import (
 )
 
 type Snapshot struct {
-	UptimeSeconds         int64   `json:"uptime_seconds"`
-	TotalRequests         int64   `json:"total_requests"`
-	SuccessRequests       int64   `json:"success_requests"`
-	FailedRequests        int64   `json:"failed_requests"`
-	AttemptFailedRequests int64   `json:"attempt_failed_requests"`
-	TotalRetries          int64   `json:"total_retries"`
-	TotalInputTokens      int64   `json:"total_input_tokens"`
-	TotalOutputTokens     int64   `json:"total_output_tokens"`
-	TotalTokens           int64   `json:"total_tokens"`
-	TotalCredits          float64 `json:"total_credits"`
+	UptimeSeconds         int64            `json:"uptime_seconds"`
+	TotalRequests         int64            `json:"total_requests"`
+	SuccessRequests       int64            `json:"success_requests"`
+	FailedRequests        int64            `json:"failed_requests"`
+	AttemptFailedRequests int64            `json:"attempt_failed_requests"`
+	TotalRetries          int64            `json:"total_retries"`
+	TotalInputTokens      int64            `json:"total_input_tokens"`
+	TotalOutputTokens     int64            `json:"total_output_tokens"`
+	TotalTokens           int64            `json:"total_tokens"`
+	TotalCredits          float64          `json:"total_credits"`
+	CompactTriggers       map[string]int64 `json:"compact_triggers,omitempty"`
 }
 
 type Collector struct {
@@ -35,10 +37,15 @@ type Collector struct {
 
 	creditsMu    sync.RWMutex
 	totalCredits float64
+	compactMu    sync.RWMutex
+	compactStats map[string]int64
 }
 
 func NewCollector() *Collector {
-	return &Collector{startTime: time.Now()}
+	return &Collector{
+		startTime:    time.Now(),
+		compactStats: make(map[string]int64),
+	}
 }
 
 func (c *Collector) RecordRequest() {
@@ -76,10 +83,28 @@ func (c *Collector) RecordFailure(meta account.FailureMeta) {
 	}
 }
 
+func (c *Collector) RecordCompact(reason string) {
+	if strings.TrimSpace(reason) == "" {
+		return
+	}
+	c.compactMu.Lock()
+	defer c.compactMu.Unlock()
+	if c.compactStats == nil {
+		c.compactStats = make(map[string]int64)
+	}
+	c.compactStats[reason]++
+}
+
 func (c *Collector) Snapshot() Snapshot {
 	c.creditsMu.RLock()
 	totalCredits := c.totalCredits
 	c.creditsMu.RUnlock()
+	c.compactMu.RLock()
+	compactTriggers := make(map[string]int64, len(c.compactStats))
+	for key, value := range c.compactStats {
+		compactTriggers[key] = value
+	}
+	c.compactMu.RUnlock()
 
 	return Snapshot{
 		UptimeSeconds:         int64(time.Since(c.startTime).Seconds()),
@@ -92,13 +117,13 @@ func (c *Collector) Snapshot() Snapshot {
 		TotalOutputTokens:     atomic.LoadInt64(&c.totalOutputTokens),
 		TotalTokens:           atomic.LoadInt64(&c.totalTokens),
 		TotalCredits:          totalCredits,
+		CompactTriggers:       compactTriggers,
 	}
 }
 
 func (c *Collector) ApplySnapshot(snapshot Snapshot) {
 	c.creditsMu.Lock()
-	defer c.creditsMu.Unlock()
-
+	c.compactMu.Lock()
 	c.startTime = time.Now().Add(-time.Duration(snapshot.UptimeSeconds) * time.Second)
 	atomic.StoreInt64(&c.totalRequests, snapshot.TotalRequests)
 	atomic.StoreInt64(&c.successRequests, snapshot.SuccessRequests)
@@ -109,4 +134,10 @@ func (c *Collector) ApplySnapshot(snapshot Snapshot) {
 	atomic.StoreInt64(&c.totalOutputTokens, snapshot.TotalOutputTokens)
 	atomic.StoreInt64(&c.totalTokens, snapshot.TotalTokens)
 	c.totalCredits = snapshot.TotalCredits
+	c.compactStats = make(map[string]int64, len(snapshot.CompactTriggers))
+	for key, value := range snapshot.CompactTriggers {
+		c.compactStats[key] = value
+	}
+	c.compactMu.Unlock()
+	c.creditsMu.Unlock()
 }

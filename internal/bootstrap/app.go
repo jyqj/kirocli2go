@@ -15,7 +15,9 @@ import (
 	"kirocli-go/internal/adapters/mcp/websearch"
 	"kirocli-go/internal/adapters/token/provider"
 	"kirocli-go/internal/adapters/upstream/clihttp"
+	"kirocli-go/internal/application/apikey"
 	"kirocli-go/internal/application/chat"
+	"kirocli-go/internal/application/session"
 	appstats "kirocli-go/internal/application/stats"
 	"kirocli-go/internal/background"
 	"kirocli-go/internal/config"
@@ -27,6 +29,7 @@ type App struct {
 	tokenPoolRunner      *background.TokenPoolRunner
 	statsPersistRunner   *background.StatePersistRunner[appstats.Snapshot]
 	catalogPersistRunner *background.StatePersistRunner[runtimecatalog.Snapshot]
+	sessionManager       *session.Manager
 }
 
 func NewApp(cfg config.Config) (*App, error) {
@@ -48,6 +51,10 @@ func NewApp(cfg config.Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	apiKeys, err := apikey.New(cfg.Security)
+	if err != nil {
+		return nil, err
+	}
 
 	_ = static.New(static.Config{
 		ThinkingSuffix: cfg.Models.ThinkingSuffix,
@@ -64,6 +71,7 @@ func NewApp(cfg config.Config) (*App, error) {
 	}, tokenProvider)
 	statsCollector := appstats.NewCollector()
 	requestLogs := appstats.NewRequestLogRing(500)
+	fakeCache := chat.NewFakeCache()
 	statsPersistRunner := background.NewStatePersistRunner(
 		cfg.State.PersistEnabled,
 		cfg.State.PersistInterval,
@@ -95,12 +103,22 @@ func NewApp(cfg config.Config) (*App, error) {
 		Timeout:      cfg.Upstream.CLITimeout,
 	})
 
+	sessionManager := session.New(session.Config{
+		Enabled:                 cfg.Session.StickyEnabled,
+		TTL:                     cfg.Session.TTL,
+		SweepInterval:           cfg.Session.SweepInterval,
+		MaxEntries:              cfg.Session.MaxEntries,
+		ContextCompactThreshold: cfg.Session.AutoCompactContextThreshold,
+	})
+
 	chatService, err := chat.NewService(chat.Dependencies{
 		Tokens:             tokenProvider,
 		Upstream:           upstream,
 		Catalog:            catalog,
+		Sessions:           sessionManager,
 		OpenAIFormatter:    openaiformatter.New(),
 		AnthropicFormatter: anthropicformatter.New(),
+		Cache:              fakeCache,
 		Stats:              statsCollector,
 		RequestLogs:        requestLogs,
 	})
@@ -115,12 +133,12 @@ func NewApp(cfg config.Config) (*App, error) {
 	}, tokenProvider)
 
 	mux := NewMux(
-		cfg,
+		apiKeys,
 		chatService,
 		catalog,
 		webSearchClient,
-		httpstats.NewHandler(statsCollector),
-		httpadmin.NewHandler(cfg, statsCollector, requestLogs, tokenProvider, catalog),
+		httpstats.NewHandler(statsCollector, sessionManager, fakeCache),
+		httpadmin.NewHandler(cfg, statsCollector, requestLogs, tokenProvider, catalog, sessionManager, apiKeys, fakeCache),
 	)
 
 	server := &http.Server{
@@ -149,6 +167,7 @@ func NewApp(cfg config.Config) (*App, error) {
 		),
 		statsPersistRunner:   statsPersistRunner,
 		catalogPersistRunner: catalogPersistRunner,
+		sessionManager:       sessionManager,
 	}, nil
 }
 
@@ -166,6 +185,9 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	if a.catalogPersistRunner != nil {
 		a.catalogPersistRunner.Start(ctx)
+	}
+	if a.sessionManager != nil {
+		a.sessionManager.Start(ctx)
 	}
 
 	go func() {

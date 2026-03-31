@@ -10,12 +10,12 @@ import (
 	"kirocli-go/internal/adapters/http/models"
 	"kirocli-go/internal/adapters/http/openai"
 	"kirocli-go/internal/adapters/mcp/websearch"
+	"kirocli-go/internal/application/apikey"
 	"kirocli-go/internal/application/chat"
-	"kirocli-go/internal/config"
 	"kirocli-go/internal/ports"
 )
 
-func NewMux(cfg config.Config, chatService *chat.Service, catalog ports.ModelCatalog, webSearch *websearch.Client, statsHandler http.Handler, adminHandler *admin.Handler) http.Handler {
+func NewMux(apiKeys *apikey.Manager, chatService *chat.Service, catalog ports.ModelCatalog, webSearch *websearch.Client, statsHandler http.Handler, adminHandler *admin.Handler) http.Handler {
 	mux := http.NewServeMux()
 	adminPageHandler := NewAdminPageHandler()
 
@@ -24,7 +24,7 @@ func NewMux(cfg config.Config, chatService *chat.Service, catalog ports.ModelCat
 	countTokensHandler := anthropic.NewCountTokensHandler()
 	modelsHandler := models.NewHandler(catalog)
 
-	protected := middleware.RequireAPIToken(cfg.Security.APIToken)
+	protected := middleware.RequireAPIKey(apiKeys)
 
 	mux.Handle("/health", http.HandlerFunc(handleHealth))
 	mux.Handle("/admin", adminPageHandler)

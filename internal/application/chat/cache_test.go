@@ -127,3 +127,32 @@ func TestPrepareAnthropicCacheMetadataMissThenHit(t *testing.T) {
 		t.Fatalf("expected cache read tokens on second request")
 	}
 }
+
+func TestComputeScopedCacheKeySeparatesNamespaces(t *testing.T) {
+	body := []byte(`{"model":"claude","messages":[{"role":"user","content":"hello"}]}`)
+	a := ComputeScopedCacheKey("key-a", body)
+	b := ComputeScopedCacheKey("key-b", body)
+	if a == b {
+		t.Fatal("expected different scoped cache keys for different api keys")
+	}
+	if a != ComputeScopedCacheKey("key-a", body) {
+		t.Fatal("expected deterministic scoped cache key")
+	}
+}
+
+func TestFakeCacheSnapshotTracksTotals(t *testing.T) {
+	cache := NewFakeCache()
+	if cache.Lookup(1) {
+		t.Fatal("expected first lookup to miss")
+	}
+	if !cache.Lookup(1) {
+		t.Fatal("expected second lookup to hit")
+	}
+	snapshot := cache.Snapshot()
+	if snapshot.Lookups != 2 || snapshot.Hits != 1 || snapshot.Misses != 1 {
+		t.Fatalf("unexpected snapshot: %+v", snapshot)
+	}
+	if snapshot.HitRate != 0.5 {
+		t.Fatalf("expected hit rate 0.5, got %v", snapshot.HitRate)
+	}
+}

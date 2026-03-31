@@ -17,16 +17,18 @@ const (
 )
 
 type AcquireHint struct {
-	Profile  Profile
-	Model    string
-	Protocol string
-	Stream   bool
+	Profile            Profile
+	Model              string
+	Protocol           string
+	Stream             bool
+	PreferredAccountID string
 }
 
 type Lease struct {
 	AccountID string
 	Token     string
 	Profile   Profile
+	HomeDir   string
 	Metadata  map[string]string
 }
 
